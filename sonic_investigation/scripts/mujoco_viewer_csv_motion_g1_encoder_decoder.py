@@ -2,7 +2,7 @@
 
 No planner. Loads a recorded reference motion from disk and feeds it (alongside
 a synthetic 'stand-still' idle reference) through the same encoder + decoder +
-MuJoCo PD stack as `run_idle_planner_decoder_mujoco.py`. Each run alternates:
+MuJoCo PD stack as `mujoco_viewer_synthetic_idle_encoder_decoder.py`. Each run alternates:
 
     idle (T_idle s) -> motion -> idle -> motion -> ... -> idle
 
@@ -22,7 +22,7 @@ with identity quat and pelvis at `default_height`, mimicking what the planner's
 IDLE mode produces.
 
 Run:
-    ./sonic_investigation/scripts/run_motion_cycle_mujoco.sh --motion <name>
+    ./sonic_investigation/scripts/mujoco_viewer_csv_motion_g1_encoder_decoder.sh --motion <name>
 """
 
 from __future__ import annotations
@@ -39,9 +39,9 @@ import onnxruntime as ort
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from run_decoder import run_decoder  # noqa: E402
-from run_encoder_modes import run_g1  # noqa: E402
-from run_idle_planner_decoder_mujoco import (  # noqa: E402
+from sonic_decoder_onnx import run_decoder  # noqa: E402
+from sonic_encoder_onnx_3modes import run_g1  # noqa: E402
+from mujoco_viewer_synthetic_idle_encoder_decoder import (  # noqa: E402
     ACTION_SCALE_MJ,
     CONTROL_DT,
     DEFAULT_ANGLES_IL,

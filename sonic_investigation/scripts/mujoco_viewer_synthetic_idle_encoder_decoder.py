@@ -13,8 +13,8 @@ The deploy's `planner_sonic.onnx` in IDLE mode produces a near-constant copy
 of `default_angles` with sub-millimeter sway; for a stand-still demo the
 constant tile is indistinguishable. To re-introduce the planner (e.g. for
 walk/run/squat modes that need a real reference motion), see `run_planner_idle`
-in the git history of this file or use `run_motion_cycle_mujoco.py` for
-playback of recorded motions.
+in the git history of this file or use `mujoco_viewer_csv_motion_g1_encoder_decoder.py`
+for playback of recorded motions.
 
 ⚠ Encoder vs decoder joint-position convention (read this before editing!)
 ─────────────────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ Velocities, last actions, base ang-vel, and gravity are NOT default-offset
 in either network — they are the values as-is.
 
 Run:
-    ./sonic_investigation/scripts/run_idle_planner_decoder_mujoco.sh
+    ./sonic_investigation/scripts/mujoco_viewer_synthetic_idle_encoder_decoder.sh
 """
 
 from __future__ import annotations
@@ -60,8 +60,8 @@ import onnxruntime as ort
 # Reuse the I/O layout helpers from the existing investigation scripts.
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from run_decoder import run_decoder  # noqa: E402
-from run_encoder_modes import run_g1  # noqa: E402
+from sonic_decoder_onnx import run_decoder  # noqa: E402
+from sonic_encoder_onnx_3modes import run_g1  # noqa: E402
 
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEPLOY_ROOT = REPO_ROOT / "gear_sonic_deploy"

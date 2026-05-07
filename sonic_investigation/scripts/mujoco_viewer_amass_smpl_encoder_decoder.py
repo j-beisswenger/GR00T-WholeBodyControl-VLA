@@ -1,6 +1,6 @@
 """SONIC AMASS-motion cycle in MuJoCo with viewer (planner-free, SMPL/'human' encoder).
 
-Same idle ↔ motion cycle as `run_motion_cycle_mujoco.py`, but the reference
+Same idle ↔ motion cycle as `mujoco_viewer_csv_motion_g1_encoder_decoder.py`, but the reference
 motion is an AMASS .npz fed through encoder mode 2 (`smpl`, the human encoder)
 instead of mode 0 (`g1`, the robot encoder).
 
@@ -22,7 +22,7 @@ identity quat, default joint angles) but routed through the SMPL encoder: 24
 joints frozen at the T-pose → world-frame joint positions for a standing person.
 
 Run:
-    ./sonic_investigation/scripts/run_amass_smpl_mujoco.sh --motion <path.npz>
+    ./sonic_investigation/scripts/mujoco_viewer_amass_smpl_encoder_decoder.sh --motion <path.npz>
 """
 
 from __future__ import annotations
@@ -40,9 +40,9 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from run_decoder import run_decoder  # noqa: E402
-from run_encoder_modes import run_smpl  # noqa: E402
-from run_idle_planner_decoder_mujoco import (  # noqa: E402
+from sonic_decoder_onnx import run_decoder  # noqa: E402
+from sonic_encoder_onnx_3modes import run_smpl  # noqa: E402
+from mujoco_viewer_synthetic_idle_encoder_decoder import (  # noqa: E402
     ACTION_SCALE_MJ,
     CONTROL_DT,
     DEFAULT_ANGLES_IL,

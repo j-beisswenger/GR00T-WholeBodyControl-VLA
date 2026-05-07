@@ -1,6 +1,6 @@
 """Run the SONIC encoder and decoder from the released PyTorch checkpoint.
 
-PyTorch counterpart of `run_encoder_modes.py` + `run_decoder.py`. Useful for:
+PyTorch counterpart of `sonic_encoder_onnx_3modes.py` + `sonic_decoder_onnx.py`. Useful for:
   - bypassing the FSQ quantizer (`quantize=False`) to get continuous tokens,
   - reading intermediate activations,
   - cross-checking the deploy ONNX numerically.

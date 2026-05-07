@@ -8,7 +8,7 @@ Robot (GMR->G1) encoder path, and overlays their resulting 64-D tokens
 for direct comparison.
 
 Run:
-    python scripts/plot_amass.py --amass-dir data/amass --smplx-dir data
+    python scripts/plot_amass_smpl_vs_g1_encoder_tokens.py --amass-dir data/amass --smplx-dir data
 """
 
 import argparse
@@ -27,10 +27,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import the verified, working logic from the sibling scripts
-from run_encoder_modes import run_smpl, run_g1
-from run_idle_planner_decoder_mujoco import build_encoder_inputs, DEPLOY_ROOT
-from run_amass_smpl_mujoco import load_amass_motion, _zero_yaw_smpl_motion, build_smpl_encoder_inputs
-from amass_to_sonic import retarget_amass, build_deploy_motion
+from sonic_encoder_onnx_3modes import run_smpl, run_g1
+from mujoco_viewer_synthetic_idle_encoder_decoder import build_encoder_inputs, DEPLOY_ROOT
+from mujoco_viewer_amass_smpl_encoder_decoder import load_amass_motion, _zero_yaw_smpl_motion, build_smpl_encoder_inputs
+from mujoco_viewer_amass_gmr_g1_encoder_decoder import retarget_amass, build_deploy_motion
 
 ENCODER_PATH = DEPLOY_ROOT / "policy/release/model_encoder.onnx"
 TOKEN_DIM = 64

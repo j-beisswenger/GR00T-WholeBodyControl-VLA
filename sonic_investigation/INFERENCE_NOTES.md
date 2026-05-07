@@ -9,10 +9,14 @@ The Python scripts that exercise these models live in [`scripts/`](scripts/):
 
 | Script | What it does |
 |---|---|
-| [`run_encoder_modes.py`](scripts/run_encoder_modes.py) | Single-shot ONNX encoder run in g1/teleop/smpl modes (1762 → 64). |
-| [`run_decoder.py`](scripts/run_decoder.py) | Single-shot ONNX decoder run (994 → 29). |
-| [`run_pytorch.py`](scripts/run_pytorch.py) | PyTorch counterparts of both, with optional `quantize=False` to bypass FSQ. |
-| [`run_idle_planner_decoder_mujoco.py`](scripts/run_idle_planner_decoder_mujoco.py) | End-to-end IDLE rollout in MuJoCo with viewer (planner + encoder + decoder + PD). |
+| [`sonic_encoder_onnx_3modes.py`](scripts/sonic_encoder_onnx_3modes.py) | Single-shot ONNX encoder run in g1/teleop/smpl modes (1762 → 64). |
+| [`sonic_decoder_onnx.py`](scripts/sonic_decoder_onnx.py) | Single-shot ONNX decoder run (994 → 29). |
+| [`sonic_encoder_decoder_pytorch_unquantized.py`](scripts/sonic_encoder_decoder_pytorch_unquantized.py) | PyTorch counterparts of both, with optional `quantize=False` to bypass FSQ. |
+| [`mujoco_viewer_synthetic_idle_encoder_decoder.py`](scripts/mujoco_viewer_synthetic_idle_encoder_decoder.py) | End-to-end IDLE rollout in MuJoCo with viewer (synthetic stand-still reference + encoder + decoder + PD). |
+| [`mujoco_viewer_csv_motion_g1_encoder_decoder.py`](scripts/mujoco_viewer_csv_motion_g1_encoder_decoder.py) | MuJoCo viewer playback of a recorded CSV reference motion through the G1/robot encoder. |
+| [`mujoco_viewer_amass_smpl_encoder_decoder.py`](scripts/mujoco_viewer_amass_smpl_encoder_decoder.py) | MuJoCo viewer playback of an AMASS .npz through the SMPL/human encoder. |
+| [`mujoco_viewer_amass_gmr_g1_encoder_decoder.py`](scripts/mujoco_viewer_amass_gmr_g1_encoder_decoder.py) | MuJoCo viewer playback of an AMASS .npz retargeted via GMR through the G1/robot encoder. |
+| [`plot_amass_smpl_vs_g1_encoder_tokens.py`](scripts/plot_amass_smpl_vs_g1_encoder_tokens.py) | Overlay 64-D encoder tokens from the SMPL and G1 paths across random AMASS clips. |
 
 ---
 
@@ -31,9 +35,9 @@ components ship in the HuggingFace release `nvidia/GEAR-SONIC`:
 dim. Each dim is effectively a 5-bit code. So the "universal token" is a 64-dim
 discrete latent, not a continuous embedding.
 
-`run_idle_planner_decoder_mujoco.py` uses all three ONNX components plus MuJoCo
-physics. The standalone `run_encoder_modes.py` / `run_decoder.py` exercise the
-encoder/decoder in isolation with synthetic inputs.
+`mujoco_viewer_synthetic_idle_encoder_decoder.py` uses both ONNX components plus
+MuJoCo physics. The standalone `sonic_encoder_onnx_3modes.py` / `sonic_decoder_onnx.py`
+exercise the encoder/decoder in isolation with synthetic inputs.
 
 ---
 
@@ -113,7 +117,7 @@ Total: 64 + 30 + 290 + 290 + 290 + 30 = **994** ✓
 
 ---
 
-## 5. What `run_idle_planner_decoder_mujoco.py` does
+## 5. What `mujoco_viewer_synthetic_idle_encoder_decoder.py` does
 
 Closed-loop IDLE rollout of planner + encoder + decoder on top of MuJoCo:
 
@@ -141,10 +145,10 @@ because `is_static_motion_mode(IDLE)` short-circuits the replan in the deploy
 ### Run
 
 ```bash
-.venv_sim/bin/python sonic_investigation/scripts/run_idle_planner_decoder_mujoco.py
+.venv_sim/bin/python sonic_investigation/scripts/mujoco_viewer_synthetic_idle_encoder_decoder.py
 ```
 
-(See also the wrapper script `run_idle_planner_decoder_mujoco.sh`.)
+(See also the wrapper script `mujoco_viewer_synthetic_idle_encoder_decoder.sh`.)
 
 ### Simplifications vs. the real control stack
 

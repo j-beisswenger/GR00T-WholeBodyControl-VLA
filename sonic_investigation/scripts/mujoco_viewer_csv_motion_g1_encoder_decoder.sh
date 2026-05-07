@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch run_motion_cycle_mujoco.py through `mjpython` (required for the
+# Launch mujoco_viewer_csv_motion_g1_encoder_decoder.py through `mjpython` (required for the
 # MuJoCo passive viewer on macOS) with DYLD_FALLBACK_LIBRARY_PATH pointing at the
 # venv's base-prefix lib/ — otherwise mjpython fails to dlopen libpython3.13.dylib
 # when the interpreter was installed via uv.
@@ -31,4 +31,4 @@ fi
 
 exec env \
     DYLD_FALLBACK_LIBRARY_PATH="${LIBPY_DIR}:${DYLD_FALLBACK_LIBRARY_PATH:-}" \
-    "${MJPYTHON}" "${SCRIPT_DIR}/run_motion_cycle_mujoco.py" "$@"
+    "${MJPYTHON}" "${SCRIPT_DIR}/mujoco_viewer_csv_motion_g1_encoder_decoder.py" "$@"

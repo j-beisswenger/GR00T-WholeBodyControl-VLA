@@ -9,7 +9,7 @@ Prereq (one-time):
     uv pip install -e GMR/
 
 Run (with the uv venv active or via uv run):
-    .venv/bin/python sonic_investigation/scripts/amass_to_sonic.py \
+    .venv/bin/python sonic_investigation/scripts/mujoco_viewer_amass_gmr_g1_encoder_decoder.py \
         --smplx_file sonic_investigation/data/amass/SFU/0005/0005_Walking001_stageii.npz
 
 Encoder asymmetry recap (see findings/encoder_inputs.md):
@@ -35,9 +35,9 @@ from scipy.spatial.transform import Slerp
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
-from run_decoder import run_decoder  # noqa: E402
-from run_encoder_modes import run_g1  # noqa: E402
-from run_idle_planner_decoder_mujoco import (  # noqa: E402
+from sonic_decoder_onnx import run_decoder  # noqa: E402
+from sonic_encoder_onnx_3modes import run_g1  # noqa: E402
+from mujoco_viewer_synthetic_idle_encoder_decoder import (  # noqa: E402
     ACTION_SCALE_MJ,
     CONTROL_DT,
     DEFAULT_ANGLES_IL,
@@ -56,11 +56,14 @@ from run_idle_planner_decoder_mujoco import (  # noqa: E402
     quat_mul,
     quat_rotate,
 )
-from run_motion_cycle_mujoco import _zero_yaw_motion, make_idle_motion  # noqa: E402
+from mujoco_viewer_csv_motion_g1_encoder_decoder import _zero_yaw_motion, make_idle_motion  # noqa: E402
 
 REPO_ROOT = SCRIPT_DIR.parents[1]
 GMR_ROOT = REPO_ROOT / "GMR"
 DEFAULT_SMPLX_FOLDER = REPO_ROOT / "sonic_investigation/data"
+DEFAULT_SMPLX_FILE = (
+    REPO_ROOT / "sonic_investigation/data/amass/SFU/0005/0005_Walking001_stageii.npz"
+)
 
 ENCODER_PATH = DEPLOY_ROOT / "policy/release/model_encoder.onnx"
 DECODER_PATH = DEPLOY_ROOT / "policy/release/model_decoder.onnx"
@@ -172,7 +175,7 @@ def build_deploy_motion(qpos_seq: np.ndarray, src_fps: float) -> dict[str, np.nd
     }
 
 
-# ----- one control tick (matches run_motion_cycle_mujoco.control_step) -----
+# ----- one control tick (matches mujoco_viewer_csv_motion_g1_encoder_decoder.control_step) -----
 
 
 def control_step(enc, dec, model, data, motion, cur_frame, hist, last_action_il, sim_steps_per_control):
@@ -227,8 +230,8 @@ def run_phase(enc, dec, model, data, viewer, motion, hist, last_action_il,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--smplx_file", type=Path, required=True,
-                        help="Path to AMASS SMPL-X .npz file.")
+    parser.add_argument("--smplx_file", type=Path, default=DEFAULT_SMPLX_FILE,
+                        help=f"Path to AMASS SMPL-X .npz file. Default: {DEFAULT_SMPLX_FILE}")
     parser.add_argument("--smplx_folder", type=Path, default=DEFAULT_SMPLX_FOLDER,
                         help=f"Folder containing smplx/SMPLX_*.pkl. Default: {DEFAULT_SMPLX_FOLDER}")
     parser.add_argument("--idle_duration", type=float, default=2.0,
