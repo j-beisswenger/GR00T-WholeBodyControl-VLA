@@ -10,7 +10,8 @@ Pipeline per AMASS file:
      SMPL-X joints 0–21 == SMPL joints 0–21; for SMPL joints 22/23 (L/R hand we
      don't have in SMPL-X) we use SMPL-X 28/43 (left/right `middle1`, base of
      the middle-finger metacarpal — the closest hand-center proxy).
-  2. Resample 120 Hz → 50 Hz to match the SONIC control rate.
+  2. Resample from the clip's native `mocap_frame_rate` (120/100/60/30 Hz, …)
+     to 50 Hz to match the SONIC control rate.
   3. Yaw-zero frame 0 so the encoder's `smpl_anchor_orientation` lines up with
      the robot starting at identity heading (same idea as `_zero_yaw_motion`
      for the g1 encoder).
@@ -122,7 +123,7 @@ def _resample(arr: np.ndarray, n_src: int, n_tgt: int) -> np.ndarray:
 
 
 def _resample_quat(q: np.ndarray, n_src: int, n_tgt: int) -> np.ndarray:
-    """Linear interp of quats with sign-flip + renorm. Good enough at 120→50 Hz."""
+    """Linear interp of quats with sign-flip + renorm. Good enough for typical AMASS→50 Hz ratios."""
     if n_src == n_tgt:
         return q.copy()
     t = np.linspace(0.0, n_src - 1, n_tgt)
