@@ -1,0 +1,6 @@
+# Local virtual environment (created locally, not tracked)
+.venv/
+
+# Encoder model checkpoint (download separately; see repo HF convention)
+encoder/model_encoder.onnx
+encoder/.cache/

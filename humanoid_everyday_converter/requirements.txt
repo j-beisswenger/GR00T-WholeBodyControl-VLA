@@ -1,0 +1,7 @@
+numpy
+pyarrow
+scipy
+tqdm
+onnxruntime
+pin
+huggingface_hub
