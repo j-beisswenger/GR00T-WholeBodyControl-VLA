@@ -176,6 +176,14 @@ class G1Deploy {
     double planner_dt_;    ///< Planner loop period  (10 Hz = 0.1 s).
     double input_dt_;      ///< Input poll period    (100 Hz = 0.01 s).
     double duration_;      ///< Duration of the INIT ramp-up to default pose (3 s).
+    double mode_ramp_t_;        ///< Elapsed time in the current mode-entry ramp ('k' / 'i').
+    double mode_ramp_duration_; ///< Duration of the mode-entry ramp to the policy target (s).
+    std::string mode_ramp_prev_motion_; ///< Previous current_motion_ name, for mode-change arming.
+    std::array<double, G1_NUM_MOTOR> mode_ramp_prev_raw_target_{}; ///< Previous raw policy target (snap diagnostics).
+    bool mode_ramp_have_prev_raw_ = false;  ///< Whether mode_ramp_prev_raw_target_ is populated.
+    bool mode_ramp_prev_using_encoder_ = false; ///< Previous is_using_encoder_, for token-source arming.
+    std::array<double, G1_NUM_MOTOR> mode_ramp_start_q_{}; ///< Joint pose captured when the ramp armed.
+    bool mode_ramp_need_start_capture_ = false; ///< Capture mode_ramp_start_q_ on the next control tick.
     int counter_;          ///< General-purpose tick counter.
     Mode mode_pr_;         ///< Ankle control mode (series PR vs. parallel AB).
     uint8_t mode_machine_; ///< Robot variant code received from LowState.
@@ -2166,6 +2174,9 @@ class G1Deploy {
         planner_dt_(0.1),
         input_dt_(0.01),
         duration_(3.0),
+        mode_ramp_t_(1e9),          // large => ramp "already complete" until first arming
+        mode_ramp_duration_(0.5),   // seconds to blend to the policy target on mode entry
+        mode_ramp_prev_motion_(),   // empty; first CONTROL tick records the live motion name
         counter_(0),
         mode_pr_(Mode::PR),
         mode_machine_(0),
@@ -3101,6 +3112,13 @@ class G1Deploy {
      * then maps the action output (IsaacLab order) to a MotorCommand
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
+    /// Arm the mode-entry ramp: restart the blend and re-capture the start pose
+    /// on the next control tick.
+    void ArmModeRamp() {
+      mode_ramp_t_ = 0.0;
+      mode_ramp_need_start_capture_ = true;
+    }
+
     bool CreatePolicyCommand() {
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
@@ -3118,11 +3136,82 @@ class G1Deploy {
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
       
+      // Mode-entry ramp: OFF->PLANNER ('k') and PLANNER<->POSE ('i') transitions
+      // would otherwise jump the target in a single tick (the robot snaps). Blend
+      // from the robot's measured pose to the policy target over
+      // mode_ramp_duration_ seconds. mode_ramp_t_ is reset to 0 at the arming
+      // edges (WAIT_FOR_CONTROL->CONTROL, and a current_motion_ name change that
+      // marks a genuine PLANNER<->POSE transition); once it passes the duration
+      // the ratio clamps to 1 and the policy target is used unchanged (identical
+      // to the previous behaviour).
+      // Arm the ramp when the token_state SOURCE flips between the encoder (driven
+      // by the reference motion) and external ZMQ tokens. This is the real
+      // discontinuity behind the observed snap: the policy's token_state
+      // observation changes origin and its output jumps in a single tick
+      // (measured: right elbow +2.4 rad when toggling ZMQ streaming). The
+      // reference-motion NAME does not change on that toggle, so the name-based
+      // detector below misses it entirely.
+      if (is_using_encoder_ != mode_ramp_prev_using_encoder_) {
+        std::cout << "[SnapDiag] ramp ARMED by token source change: "
+                  << (mode_ramp_prev_using_encoder_ ? "encoder" : "external_token")
+                  << " -> " << (is_using_encoder_ ? "encoder" : "external_token") << std::endl;
+        mode_ramp_prev_using_encoder_ = is_using_encoder_;
+        ArmModeRamp();
+      }
+
+      // Capture the ramp start pose ONCE, when armed, so the blend follows a fixed
+      // trajectory from where the robot actually was at the transition. Blending
+      // against the LIVE measured pose instead would command ~zero position error
+      // every tick, zeroing the PD torque and making the robot go limp mid-ramp.
+      if (mode_ramp_need_start_capture_) {
+        const std::shared_ptr<const LowState_> ls = used_low_state_data_.data;
+        if (ls) {
+          for (int i = 0; i < G1_NUM_MOTOR; i++) {
+            mode_ramp_start_q_[i] = ls->motor_state()[i].q();
+          }
+          mode_ramp_need_start_capture_ = false;
+        } else {
+          mode_ramp_t_ = mode_ramp_duration_;  // no state available => skip this ramp
+        }
+      }
+
+      mode_ramp_t_ += control_dt_;
+      const double ramp_ratio = std::clamp(mode_ramp_t_ / mode_ramp_duration_, 0.0, 1.0);
+      const bool ramping = (ramp_ratio < 1.0) && !mode_ramp_need_start_capture_;
+
+      // --- Snap diagnostics (temporary instrumentation) ------------------------
+      // Report any tick where the RAW policy target jumps discontinuously, so we
+      // can see which transitions snap and whether the ramp was armed for them.
+      std::array<double, G1_NUM_MOTOR> raw_target{};
+      for (int i = 0; i < G1_NUM_MOTOR; i++) {
+        raw_target[i] = default_angles[i] +
+            static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
+      }
+      if (mode_ramp_have_prev_raw_) {
+        double max_jump = 0.0;
+        int max_joint = -1;
+        for (int i = 0; i < G1_NUM_MOTOR; i++) {
+          const double d = std::fabs(raw_target[i] - mode_ramp_prev_raw_target_[i]);
+          if (d > max_jump) { max_jump = d; max_joint = i; }
+        }
+        if (max_jump > 0.15) {  // rad within one 20 ms tick => discontinuity
+          std::cout << "[SnapDiag] raw target jump " << max_jump << " rad on joint "
+                    << max_joint << " | ramp_ratio=" << ramp_ratio
+                    << " ramping=" << (ramping ? "YES" : "NO") << std::endl;
+        }
+      }
+      mode_ramp_prev_raw_target_ = raw_target;
+      mode_ramp_have_prev_raw_ = true;
+      // -------------------------------------------------------------------------
+
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
         last_action[i] = static_cast<double>(floatarr[i]);
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        double target = raw_target[i];
+        if (ramping) {
+          target = mode_ramp_start_q_[i] * (1.0 - ramp_ratio) + target * ramp_ratio;
+        }
+        motor_command_tmp.q_target.at(i) = static_cast<float>(target);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
@@ -3833,6 +3922,8 @@ class G1Deploy {
             }
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
             program_state_ = ProgramState::CONTROL;
+            ArmModeRamp();              // arm mode-entry ramp on OFF->CONTROL ('k')
+            std::cout << "[SnapDiag] ramp ARMED by WAIT_FOR_CONTROL->CONTROL ('k')" << std::endl;
           }
           break;
 
@@ -3930,6 +4021,20 @@ class G1Deploy {
               return;
             }
           } // Release lock after all observation-dependent operations
+
+          // Arm the mode-entry ramp on a genuine mode transition. current_motion_
+          // is renamed by the safety reset that accompanies every mode switch
+          // ("planner_motion" in PLANNER, "temporary_motion" while streaming poses)
+          // and is otherwise stable during streaming/looping, so a name change is a
+          // reliable transition signal. (operator_state.play is NOT usable here: the
+          // temporary motion loops and toggles play false->true mid-stream, which
+          // would spuriously re-arm the ramp and make POSE-mode motion sluggish.)
+          if (current_motion_copy && current_motion_copy->name != mode_ramp_prev_motion_) {
+            std::cout << "[SnapDiag] ramp ARMED by motion change: '" << mode_ramp_prev_motion_
+                      << "' -> '" << current_motion_copy->name << "'" << std::endl;
+            ArmModeRamp();
+            mode_ramp_prev_motion_ = current_motion_copy->name;
+          }
 
           // Log post-state data (token state) to the most recent state logger entry
           // This must be called after GatherObservations() which populates token_state_data_

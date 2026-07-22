@@ -132,6 +132,10 @@ class InferenceLaunchConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy."""
 
+    initial_pose_blend_duration: float = 2.0
+    """Duration (seconds) for smooth interpolation to the initial pose when
+    pressing 'i'. Higher = slower/smoother. Set to 0 to snap instantly."""
+
     # Camera
     camera_host: str = "localhost"
     """Camera server host."""
@@ -383,6 +387,7 @@ def main(config: InferenceLaunchConfig):
         f"--prompt '{config.prompt}' "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
+        f"--initial-pose-blend-duration {config.initial_pose_blend_duration} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
     )

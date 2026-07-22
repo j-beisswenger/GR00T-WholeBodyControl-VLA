@@ -115,7 +115,7 @@ class InferenceConfig:
     """The language prompt for the VLA policy."""
 
     # Initial pose
-    initial_pose_blend_duration: float = 1.0
+    initial_pose_blend_duration: float = 2.0
     """Duration (seconds) for smooth interpolation to initial pose. The robot
     blends from its current motion token to the initial pose token over this
     period. Set to 0 to snap instantly (no blend)."""
@@ -190,18 +190,40 @@ def pack_latent_action_message(
     return pack_pose_message(pose_data, topic="pose", version=4)
 
 
-def get_action_field(action_dict: dict, key: str):
-    """Get action field from dict, checking both with and without 'action.' prefix."""
+def get_action_field(action_dict: dict, key: str, required: bool = True):
+    """Get action field from dict, checking both with and without 'action.' prefix.
+
+    Body-only models (and robots without hands) emit no hand fields, so callers
+    pass ``required=False`` for those and get ``None`` instead of an error.
+    """
     value = action_dict.get(key)
     if value is not None:
         return value
     value = action_dict.get(f"action.{key}")
     if value is not None:
         return value
+    if not required:
+        return None
     raise AssertionError(
         f"Required action field '{key}' (or 'action.{key}') not found in processed_action. "
         f"Available keys: {list(action_dict.keys())}"
     )
+
+
+def select_action_step(array, index: int):
+    """Reduce a ``(B, T, D)`` or ``(T, D)`` action array to the entry at ``index``.
+
+    Returns ``None`` for absent optional fields, so hand joints stay unset all
+    the way through to the ZMQ message.
+    """
+    if array is None:
+        return None
+    array = np.asarray(array, dtype=np.float32)
+    if array.ndim == 3:
+        array = array[0]
+    if array.ndim == 2:
+        array = array[min(index, array.shape[0] - 1)]
+    return array
 
 
 # ---------------------------------------------------------------------------
@@ -688,37 +710,35 @@ def main(config: InferenceConfig):
                 if processed_action is None or not processed_action:
                     print("[DEBUG] processed_action is None or empty, skipping", flush=True)
                 else:
+                    # Action arrays arrive as (B, T, D) from the model.
+                    # Squeeze batch dim to get (T, D), then index by time step.
                     motion_token = np.asarray(
                         get_action_field(processed_action, "motion_token"),
                         dtype=np.float32,
                     )
-                    left_hand_joints = np.asarray(
-                        get_action_field(processed_action, "left_hand_joints"),
-                        dtype=np.float32,
-                    )
-                    right_hand_joints = np.asarray(
-                        get_action_field(processed_action, "right_hand_joints"),
-                        dtype=np.float32,
-                    )
-
-                    # Action arrays arrive as (B, T, D) from the model.
-                    # Squeeze batch dim to get (T, D), then index by time step.
                     if motion_token.ndim == 3:
                         motion_token = motion_token[0]
-                    if left_hand_joints.ndim == 3:
-                        left_hand_joints = left_hand_joints[0]
-                    if right_hand_joints.ndim == 3:
-                        right_hand_joints = right_hand_joints[0]
 
                     horizon = motion_token.shape[0] if motion_token.ndim == 2 else 1
                     current_idx = min(action_chunk_index, horizon - 1)
 
                     if motion_token.ndim == 2:
                         motion_token = motion_token[current_idx]
-                    if left_hand_joints.ndim == 2:
-                        left_hand_joints = left_hand_joints[current_idx]
-                    if right_hand_joints.ndim == 2:
-                        right_hand_joints = right_hand_joints[current_idx]
+
+                    # Optional: body-only models emit no hand joints. Left as
+                    # None, they are simply omitted from the v4 pose message.
+                    left_hand_joints = select_action_step(
+                        get_action_field(
+                            processed_action, "left_hand_joints", required=False
+                        ),
+                        current_idx,
+                    )
+                    right_hand_joints = select_action_step(
+                        get_action_field(
+                            processed_action, "right_hand_joints", required=False
+                        ),
+                        current_idx,
+                    )
 
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
