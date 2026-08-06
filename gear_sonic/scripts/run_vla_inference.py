@@ -369,7 +369,7 @@ def _inference_worker_loop(
                 # inference starts, not when it returns: `prev_chunk_tail` has to be sliced at
                 # the index being executed right now, so that tail[k] lines up with index k of
                 # the chunk about to be generated. Legacy callers may still enqueue None.
-                options = inference_queue.get(timeout=0.1)
+                dispatch_time, options = inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -380,7 +380,12 @@ def _inference_worker_loop(
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
 
-                inference_start_time = time.monotonic()
+                # Measure from DISPATCH, not from here. `prev_chunk_tail` was sliced in the main
+                # loop at dispatch, so tail[k] is the tick of dispatch+k; timing from after
+                # prepare_obs_fn() would omit the observation-build time and under-estimate the
+                # delay, which shifts the chunk earlier than the guidance placed it -- the
+                # direction that brings the chunk-boundary jump back.
+                inference_start_time = dispatch_time
                 processed_action = inference_fn(observation, options)
 
                 if processed_action is not None:
@@ -759,7 +764,7 @@ def main(config: InferenceConfig):
                             ),
                         }
                 try:
-                    inference_queue.put_nowait(request_options)
+                    inference_queue.put_nowait((time.monotonic(), request_options))
                 except queue.Full:
                     pass
 
