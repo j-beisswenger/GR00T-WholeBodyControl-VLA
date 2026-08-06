@@ -576,6 +576,9 @@ def main(config: InferenceConfig):
     action_chunk_index = 0
     last_inference_time = 0.0
     inference_interval = 1.0 / config.rate
+    # Latches the "waiting for the first chunk" notice so it prints once per stall rather than on
+    # every 20 ms tick. Cleared whenever a chunk lands, so each new stall reports itself once.
+    logged_awaiting_chunk = False
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
@@ -714,6 +717,7 @@ def main(config: InferenceConfig):
                 )
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
+                logged_awaiting_chunk = False
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", '
                     f"latency: {inference_delay:.3f}s)"
@@ -767,7 +771,19 @@ def main(config: InferenceConfig):
 
             with telemetry.timer("total_loop"):
                 if cached_action_chunk is None:
-                    print("[DEBUG] No cached chunk yet, waiting...", flush=True)
+                    # Normal at the 'k' -> 'i' -> 'p' handover: 'i' clears the cache, so resuming
+                    # leaves one inference delay with no plan to publish. The controller holds the
+                    # last token it received (the initial pose), and real-time chunking anchors the
+                    # first chunk to exactly that token, so this is a defined state, not a fault.
+                    if not logged_awaiting_chunk:
+                        if last_sent_motion_token is None:
+                            print("Waiting for the first action chunk (nothing published yet).",
+                                  flush=True)
+                        else:
+                            print("Waiting for the first action chunk; the controller is holding "
+                                  "the last token published (after 'i', the initial pose).",
+                                  flush=True)
+                        logged_awaiting_chunk = True
                     _sleep_remaining(t_start, loop_period)
                     continue
 
