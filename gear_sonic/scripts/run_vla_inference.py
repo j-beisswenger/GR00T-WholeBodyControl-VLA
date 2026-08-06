@@ -322,17 +322,23 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
         processed_action dict or None on error.
     """
     try:
-        action, _info = policy.get_action(observation, options)
+        action, info = policy.get_action(observation, options)
 
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
 
         motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
-        if np.abs(action[motion_key]).max() > 1.25:
+        # The server bounds tokens to the FSQ range before returning, so this check on the
+        # RECEIVED chunk can no longer fire on its own. It reports the pre-clip magnitude
+        # instead; use it when present, so a diverging chunk is still rejected. This matters
+        # specifically under real-time chunking, whose guidance is what can blow tokens up
+        # while making the join look perfect.
+        token_max = (info or {}).get("token_max_preclip")
+        token_max = float(token_max) if token_max is not None else float(np.abs(action[motion_key]).max())
+        if token_max > 1.25:
             print(
                 f"[Warning] action['{motion_key}'] max "
-                f"({np.abs(action[motion_key]).max():.4f}) > 1.25. "
-                "Exceeds action bound, skipping."
+                f"({token_max:.4f}) > 1.25. Exceeds action bound, skipping."
             )
             return None
 
@@ -737,6 +743,7 @@ def main(config: InferenceConfig):
                         # While paused (and right after 'i') the cache holds chunks that were
                         # never executed -- the robot is holding the last token it published.
                         holding=pause_loop,
+                        action_horizon=config.action_horizon,
                     )
                     if prev_tail is not None:
                         request_options = {

@@ -99,10 +99,17 @@ def should_trigger_new_inference(
     Returns:
         True if new inference should start.
     """
-    if not cached_chunk_exists:
-        return True
+    # The busy check comes FIRST. With it second, a missing cached chunk re-dispatched on every
+    # 20 ms tick while the first inference was still in flight: the worker drains the (maxsize=1)
+    # queue at the START of a request, so a second one queued behind it and landed ~20 ticks
+    # later carrying a tail built before the first chunk existed -- an anchor no longer in force,
+    # which then overwrote the good chunk. `i` clears the cache, so this fired precisely at the
+    # idle -> VLA handover: the largest discontinuity in a run, and the one RTC most needs to
+    # get right.
     if inference_thread_running:
         return False
+    if not cached_chunk_exists:
+        return True
     return time_since_last_inference >= inference_interval
 
 
@@ -111,6 +118,7 @@ def build_prev_chunk_tail(
     action_chunk_index: int,
     last_published_token: Any,
     holding: bool,
+    action_horizon: int | None = None,
 ) -> "np.ndarray | None":
     """The motion tokens this robot will execute if no new chunk ever arrives.
 
@@ -165,11 +173,18 @@ def build_prev_chunk_tail(
     if tokens.ndim != 2 or tokens.shape[0] == 0:
         return None
 
-    start = int(np.clip(action_chunk_index, 0, tokens.shape[0] - 1))
-    return tokens[start:]
+    # Clamp against the horizon the publish loop actually walks, NOT the chunk length. They
+    # differ when --action-horizon is left at its 40 default while the model emits 50: the loop
+    # then stops at index 39 and re-publishes it forever, so advertising tokens 40..49 as "what
+    # I will execute" would anchor the guidance to ticks that never happen.
+    last = tokens.shape[0] if action_horizon is None else min(int(action_horizon), tokens.shape[0])
+    last = max(last, 1)
+    start = int(np.clip(action_chunk_index, 0, last - 1))
+    return tokens[start:last]
 
 
-def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: int) -> int:
+def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: int,
+                             outlier_s: float = 1.0) -> int:
     """Inference delay in controller ticks, estimated pessimistically.
 
     Real-time chunking freezes the first ``d`` actions of a new chunk to the previous plan,
@@ -187,7 +202,13 @@ def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: 
     Returns:
         d in ticks, 0 when no delay has been observed yet.
     """
-    delays = [d for d in delay_buffer if d is not None]
+    # Drop non-predictive outliers first. The guided sampler is a separate XLA program, so the
+    # first request carrying a previous chunk pays a one-off JIT compile of tens of seconds.
+    # That is measured as an inference delay like any other, and because this is a MAX over the
+    # buffer, one such sample would pin d at the clamp for the next `maxlen` inferences -- which
+    # freezes the robot on a plan that is almost entirely repeat-padding. A compile is not a
+    # prediction of the next delay, so it does not belong in the estimate.
+    delays = [d for d in delay_buffer if d is not None and d <= outlier_s]
     if not delays:
         return 0
     return calculate_latency_compensated_index(max(delays), control_freq, action_horizon)

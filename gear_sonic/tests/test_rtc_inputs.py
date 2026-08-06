@@ -11,6 +11,7 @@ import numpy as np
 from gear_sonic.utils.inference.vla_utils import (
     build_prev_chunk_tail,
     conservative_delay_ticks,
+    should_trigger_new_inference,
 )
 
 HORIZON, DIM = 50, 64
@@ -84,4 +85,38 @@ def test_delay_estimate_is_the_max_not_the_mean():
 
 def test_delay_estimate_handles_cold_start_and_is_bounded_by_the_horizon():
     assert conservative_delay_ticks([], 50, HORIZON) == 0
-    assert conservative_delay_ticks([99.0], 50, HORIZON) == HORIZON - 1
+    # Within the plausible band it is still clamped to the horizon.
+    assert conservative_delay_ticks([0.9], 50, HORIZON, outlier_s=1.0) == 45
+
+
+def test_jit_compile_outlier_does_not_pin_the_delay_estimate():
+    # The guided sampler is a separate XLA program, so the first request carrying a previous
+    # chunk pays a one-off compile of tens of seconds. As a plain MAX over the buffer that
+    # would pin d at the clamp for the next `maxlen` inferences and freeze the robot on a
+    # nearly-constant plan. A compile is not a prediction of the next delay.
+    steady = [0.05, 0.06, 0.05]
+    assert conservative_delay_ticks([60.0, *steady], 50, HORIZON) == 3   # == max(steady)
+    assert conservative_delay_ticks([60.0], 50, HORIZON) == 0            # nothing usable yet
+
+
+def test_tail_is_clamped_to_the_publish_horizon_not_the_chunk_length():
+    # --action-horizon 40 against a 50-token model: the loop stops at 39 and re-publishes it,
+    # so tokens 40..49 must not be advertised as "what I will execute".
+    tail = build_prev_chunk_tail(_chunk(), 20, _held(), holding=False, action_horizon=40)
+    assert tail.shape == (20, DIM)
+    assert tail[-1][0] == 39.0
+
+
+def test_no_redispatch_while_an_inference_is_already_running():
+    # Regression: with the cache-empty check first, a missing chunk re-dispatched every tick
+    # while the first inference was in flight, and the second request carried a stale anchor.
+    # 'i' clears the cache, so this fired at the idle -> VLA handover.
+    assert not should_trigger_new_inference(
+        cached_chunk_exists=False, inference_thread_running=True,
+        time_since_last_inference=0.02, inference_interval=0.4,
+    )
+    # Still dispatches immediately when nothing is running and there is no plan.
+    assert should_trigger_new_inference(
+        cached_chunk_exists=False, inference_thread_running=False,
+        time_since_last_inference=0.02, inference_interval=0.4,
+    )
