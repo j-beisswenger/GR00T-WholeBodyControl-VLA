@@ -23,6 +23,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   f  -> stop recording failure (handled by data exporter)
 """
 
+import collections
 from dataclasses import dataclass
 import queue
 import threading
@@ -43,8 +44,10 @@ from gear_sonic.utils.data_collection.transforms import compute_projected_gravit
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
 from gear_sonic.utils.inference.vla_utils import (
+    build_prev_chunk_tail,
     calculate_latency_compensated_index,
     concat_action,
+    conservative_delay_ticks,
     prepare_observation_for_eval,
     should_trigger_new_inference,
 )
@@ -119,6 +122,16 @@ class InferenceConfig:
     """Duration (seconds) for smooth interpolation to initial pose. The robot
     blends from its current motion token to the initial pose token over this
     period. Set to 0 to snap instantly (no blend)."""
+
+    # Real-time chunking (arXiv:2506.07339)
+    rtc: bool = True
+    """Send the previous action chunk's remaining tail and the inference delay to the policy
+    server, so it can generate the next chunk continuously with the one being executed. Costs
+    one extra array per request. A server that does not implement RTC ignores the options and
+    behaves exactly as before, so this is safe to leave on."""
+
+    rtc_delay_buffer_size: int = 10
+    """How many recent inference delays to keep. `d` is the max over this window."""
 
     # Debug
     verbose_timing: bool = False
@@ -297,14 +310,19 @@ def prepare_observation_from_sensors(
     return observation
 
 
-def run_policy_inference_and_process(policy, observation, robot_model):
+def run_policy_inference_and_process(policy, observation, robot_model, options=None):
     """Run policy inference via Isaac-GR00T PolicyClient and process results.
+
+    Args:
+        options: Optional dict forwarded verbatim to the server. Carries the real-time-chunking
+            inputs (``prev_chunk_tail``, ``delay_ticks``); the server ignores it if it does not
+            implement RTC, so this stays compatible with a stock policy server.
 
     Returns:
         processed_action dict or None on error.
     """
     try:
-        action, _info = policy.get_action(observation)
+        action, _info = policy.get_action(observation, options)
 
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
@@ -340,7 +358,12 @@ def _inference_worker_loop(
     while not stop_event.is_set():
         try:
             try:
-                inference_queue.get(timeout=0.1)
+                # The queue item is the request options captured by the main loop AT DISPATCH
+                # (see the trigger site). For real-time chunking these must be sampled when
+                # inference starts, not when it returns: `prev_chunk_tail` has to be sliced at
+                # the index being executed right now, so that tail[k] lines up with index k of
+                # the chunk about to be generated. Legacy callers may still enqueue None.
+                options = inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -352,7 +375,7 @@ def _inference_worker_loop(
                     continue
 
                 inference_start_time = time.monotonic()
-                processed_action = inference_fn(observation)
+                processed_action = inference_fn(observation, options)
 
                 if processed_action is not None:
                     try:
@@ -437,6 +460,7 @@ def main(config: InferenceConfig):
 
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
+        nonlocal last_sent_motion_token
         print("Moving to initial pose")
         left_hand = (
             _compute_closed_hand_joints("L")
@@ -455,6 +479,10 @@ def main(config: InferenceConfig):
             right_hand_joints=right_hand,
         )
         zmq_socket.send(zmq_message)
+        # The controller holds the last token it received, so from here the robot is executing
+        # this one until the policy loop resumes. Record it: it is the previous plan that
+        # real-time chunking makes the first post-'i' chunk continuous with.
+        last_sent_motion_token = np.asarray(LATENT_INITIAL_MOTION_TOKEN, dtype=np.float32).copy()
         print_green("Sent latent initial pose via ZMQ")
         time.sleep(1.0)
         print("Initial pose done.")
@@ -545,6 +573,12 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
+
+    # Real-time chunking: recent inference delays (seconds). `d` is taken as the MAX over this
+    # window, not the mean -- under-estimating the delay leaves an already-executed tick
+    # unfrozen and the chunk-boundary discontinuity returns, while over-estimating only costs
+    # a little reactivity. See vla_utils.conservative_delay_ticks.
+    rtc_delay_buffer: collections.deque = collections.deque(maxlen=config.rtc_delay_buffer_size)
 
     PROMPT_MSG_PREFIX = "prompt:"
 
@@ -648,10 +682,11 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
             ),
-            lambda obs: run_policy_inference_and_process(
+            lambda obs, options=None: run_policy_inference_and_process(
                 policy=n1_policy,
                 observation=obs,
                 robot_model=robot_model,
+                options=options,
             ),
         ),
         daemon=True,
@@ -667,6 +702,7 @@ def main(config: InferenceConfig):
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
                 inference_delay = time.monotonic() - inference_start_time
+                rtc_delay_buffer.append(inference_delay)  # feeds the conservative `d` estimate
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
                 )
@@ -688,8 +724,31 @@ def main(config: InferenceConfig):
             )
 
             if should_start:
+                # Build the RTC options HERE, at dispatch. `prev_chunk_tail` must be sliced at
+                # the index being executed right now so that tail[k] lands on the same tick as
+                # index k of the chunk about to be generated; sampling it when the reply arrives
+                # would be off by the whole inference delay.
+                request_options = None
+                if config.rtc:
+                    prev_tail = build_prev_chunk_tail(
+                        cached_action_chunk=cached_action_chunk,
+                        action_chunk_index=action_chunk_index,
+                        last_published_token=last_sent_motion_token,
+                        # While paused (and right after 'i') the cache holds chunks that were
+                        # never executed -- the robot is holding the last token it published.
+                        holding=pause_loop,
+                    )
+                    if prev_tail is not None:
+                        request_options = {
+                            "prev_chunk_tail": prev_tail,
+                            "delay_ticks": conservative_delay_ticks(
+                                rtc_delay_buffer,
+                                config.action_publish_rate,
+                                config.action_horizon,
+                            ),
+                        }
                 try:
-                    inference_queue.put_nowait(None)
+                    inference_queue.put_nowait(request_options)
                 except queue.Full:
                     pass
 
