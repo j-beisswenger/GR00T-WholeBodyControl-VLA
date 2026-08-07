@@ -76,17 +76,38 @@ def test_index_past_the_end_is_clamped_not_an_empty_tail():
     assert tail.shape == (1, DIM)
 
 
-def test_delay_estimate_is_the_max_not_the_mean():
-    # Under-estimating d leaves an already-executed tick unfrozen and the seam comes back;
-    # over-estimating only costs reactivity. Algorithm 1 takes max over the buffer.
-    assert conservative_delay_ticks([0.02, 0.30, 0.04], 50, HORIZON) == 15
+def test_delay_estimate_is_biased_high_not_the_mean():
+    # Under-estimating d leaves an already-executed tick unfrozen and the seam comes back, so on a
+    # right-tailed latency distribution the estimate must track the tail, not the centre.
+    tailed = [0.10] * 16 + [0.30] * 4
+    assert conservative_delay_ticks(tailed, 50, HORIZON) == 15   # p90 = 0.30 s
+    assert round(np.mean(tailed) * 50) == 7                      # the mean would under-freeze
     assert conservative_delay_ticks([0.02], 50, HORIZON) == 1
 
 
+def test_one_latency_spike_does_not_own_the_delay_estimate():
+    # Regression: as a MAX, a single 600 ms spike (~3x typical) became the answer and was then
+    # re-read from the buffer on every request until it aged out -- d pinned at 30 ticks for the
+    # whole window, ~10 s, with half of each chunk frozen to an already-finished plan. The tell
+    # was a *constant* d in the server log; a live measurement jitters.
+    window = [0.20] * 19 + [0.60]
+    assert conservative_delay_ticks(window, 50, HORIZON) == 10          # p90 ignores the outlier
+    assert max(window) * 50 == 30.0                                     # what MAX would have sent
+
+    # Sustained growth must still move it -- this is a robustness fix, not a smoothing filter.
+    sustained = [0.20] * 10 + [0.60] * 10
+    assert conservative_delay_ticks(sustained, 50, HORIZON) == 30
+
+
 def test_delay_estimate_handles_cold_start_and_is_bounded_by_the_horizon():
-    assert conservative_delay_ticks([], 50, HORIZON) == 0
+    # Fails SAFE, not open: with nothing usable it still pins a few ticks. Returning 0 would pin
+    # nothing and hand back the chunk-boundary seam exactly when the delay is least understood.
+    assert conservative_delay_ticks([], 50, HORIZON) == 3
+    assert conservative_delay_ticks([], 50, HORIZON, fallback_ticks=0) == 0
     # Within the plausible band it is still clamped to the horizon.
     assert conservative_delay_ticks([0.9], 50, HORIZON, outlier_s=1.0) == 45
+    # The fallback cannot exceed the chunk either.
+    assert conservative_delay_ticks([], 50, 2, fallback_ticks=99) == 1
 
 
 def test_jit_compile_outlier_does_not_pin_the_delay_estimate():
@@ -95,8 +116,8 @@ def test_jit_compile_outlier_does_not_pin_the_delay_estimate():
     # would pin d at the clamp for the next `maxlen` inferences and freeze the robot on a
     # nearly-constant plan. A compile is not a prediction of the next delay.
     steady = [0.05, 0.06, 0.05]
-    assert conservative_delay_ticks([60.0, *steady], 50, HORIZON) == 3   # == max(steady)
-    assert conservative_delay_ticks([60.0], 50, HORIZON) == 0            # nothing usable yet
+    assert conservative_delay_ticks([60.0, *steady], 50, HORIZON) == 3   # the steady samples win
+    assert conservative_delay_ticks([60.0], 50, HORIZON) == 3            # nothing usable -> fallback
 
 
 def test_tail_is_clamped_to_the_publish_horizon_not_the_chunk_length():

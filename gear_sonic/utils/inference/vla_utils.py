@@ -184,31 +184,61 @@ def build_prev_chunk_tail(
 
 
 def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: int,
-                             outlier_s: float = 1.0) -> int:
-    """Inference delay in controller ticks, estimated pessimistically.
+                             outlier_s: float = 1.0, percentile: float = 90.0,
+                             fallback_ticks: int = 3) -> int:
+    """Inference delay in controller ticks, estimated with an upper quantile.
 
     Real-time chunking freezes the first ``d`` actions of a new chunk to the previous plan,
-    because those ticks will have elapsed before the chunk lands. Under-estimating ``d`` leaves
-    an already-executed tick unfrozen and the discontinuity comes back; over-estimating only
-    costs reactivity (the new plan takes effect a little later). So take the MAX over recent
-    delays, per Algorithm 1 of arXiv:2506.07339 ("estimate the next inference delay
-    conservatively"), not the mean.
+    because those ticks will have elapsed before the chunk lands. The error is asymmetric, so
+    the estimate is deliberately biased high: under-estimating ``d`` leaves an already-executed
+    tick unfrozen and the discontinuity comes back, while over-estimating costs reactivity.
+
+    This is the "estimate the next inference delay conservatively" step of Algorithm 1
+    (arXiv:2506.07339), but as a **high quantile rather than the MAX**. A max is the most
+    conservative statistic available and also the least robust: a single slow sample becomes the
+    answer, and -- because it is re-read from the buffer rather than re-measured -- it is
+    returned bit-identically on every subsequent request until it ages out. On the real robot one
+    600 ms spike (~3x typical) pinned d at 30 ticks for a full buffer's worth of inferences,
+    roughly 10 s, during which half of every chunk was frozen to a plan the robot had already
+    finished executing. The tell is a *constant* d in the logs; a live measurement jitters.
+
+    p90 keeps the upward bias -- it still sits above typical latency, so the seam stays closed --
+    while a lone outlier in a buffer of 20 falls outside the quantile entirely and is ignored.
+    Sustained latency growth still moves it, once more than a tenth of the window is slow.
 
     Args:
         delay_buffer: Recent measured inference delays in seconds (e.g. a deque).
         control_freq: Controller rate in Hz -- the token publish rate, 50 for SONIC.
         action_horizon: Chunk length, used to bound the result.
+        outlier_s: Samples above this are dropped as non-predictive (see below).
+        percentile: Quantile of the retained samples to use, in [0, 100].
+        fallback_ticks: d to use when no sample is usable. Deliberately small but NOT zero.
 
     Returns:
-        d in ticks, 0 when no delay has been observed yet.
+        d in ticks, ``fallback_ticks`` when no delay has been observed yet.
+
+    Note:
+        The invariant that matters is ``d_pred >= d_act``, not equality. The robot enters the new
+        chunk at the slot matching its *actual* delay, so over-predicting means it starts inside
+        the pinned region and simply follows the old plan a little longer -- continuous, just less
+        reactive. Under-predicting drops it past the pin, into slots the model generated on the
+        assumption that the robot had already diverged onto the new plan; it had not, and that is
+        the seam. Hence the upward bias, and hence a non-zero fallback: returning 0 when the buffer
+        holds nothing usable pins nothing at all, which is a guaranteed seam at precisely the
+        moment the estimate is least trustworthy.
     """
     # Drop non-predictive outliers first. The guided sampler is a separate XLA program, so the
     # first request carrying a previous chunk pays a one-off JIT compile of tens of seconds.
-    # That is measured as an inference delay like any other, and because this is a MAX over the
-    # buffer, one such sample would pin d at the clamp for the next `maxlen` inferences -- which
-    # freezes the robot on a plan that is almost entirely repeat-padding. A compile is not a
-    # prediction of the next delay, so it does not belong in the estimate.
+    # A compile is not a prediction of the next delay, so it does not belong in the estimate --
+    # and at small buffer occupancy it would still drag the quantile up even though p90 alone
+    # already discards a single outlier once the buffer is reasonably full.
     delays = [d for d in delay_buffer if d is not None and d <= outlier_s]
     if not delays:
-        return 0
-    return calculate_latency_compensated_index(max(delays), control_freq, action_horizon)
+        # Fail SAFE, not open. This fires on a cold buffer and when every sample is an outlier
+        # (a stall long enough that RTC cannot rescue it anyway -- the chunk is only 0.8 s). The
+        # old behaviour returned 0, i.e. "pin nothing", handing back the chunk-boundary
+        # discontinuity exactly when the delay is least understood. A few ticks of pin keeps the
+        # join closed and costs almost no reactivity if the true delay turns out to be small.
+        return int(np.clip(fallback_ticks, 0, max(action_horizon - 1, 0)))
+    estimate = float(np.percentile(delays, percentile))
+    return calculate_latency_compensated_index(estimate, control_freq, action_horizon)

@@ -130,8 +130,10 @@ class InferenceConfig:
     one extra array per request. A server that does not implement RTC ignores the options and
     behaves exactly as before, so this is safe to leave on."""
 
-    rtc_delay_buffer_size: int = 10
-    """How many recent inference delays to keep. `d` is the max over this window."""
+    rtc_delay_buffer_size: int = 20
+    """How many recent inference delays to keep. `d` is the p90 over this window. Needs to be
+    large enough that a single slow sample sits outside the quantile -- at 20, one outlier is
+    ignored outright; at 10 it still carries about a tenth of the estimate."""
 
     # Debug
     verbose_timing: bool = False
@@ -584,14 +586,18 @@ def main(config: InferenceConfig):
     # Latches the "waiting for the first chunk" notice so it prints once per stall rather than on
     # every 20 ms tick. Cleared whenever a chunk lands, so each new stall reports itself once.
     logged_awaiting_chunk = False
+    # The pause path now ticks at the full control rate, so its notice needs throttling in time
+    # rather than by the loop period that used to gate it.
+    PAUSE_NOTICE_INTERVAL_S = 2.0
+    last_pause_notice = 0.0
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
 
-    # Real-time chunking: recent inference delays (seconds). `d` is taken as the MAX over this
-    # window, not the mean -- under-estimating the delay leaves an already-executed tick
-    # unfrozen and the chunk-boundary discontinuity returns, while over-estimating only costs
-    # a little reactivity. See vla_utils.conservative_delay_ticks.
+    # Real-time chunking: recent inference delays (seconds). `d` is the p90 over this window --
+    # biased high, because under-estimating leaves an already-executed tick unfrozen and the
+    # chunk-boundary discontinuity returns, but not the MAX, which let one slow sample own the
+    # estimate for a whole buffer's worth of inferences. See vla_utils.conservative_delay_ticks.
     rtc_delay_buffer: collections.deque = collections.deque(maxlen=config.rtc_delay_buffer_size)
 
     PROMPT_MSG_PREFIX = "prompt:"
@@ -769,9 +775,17 @@ def main(config: InferenceConfig):
                     pass
 
             if pause_loop:
-                print("Pausing...", end="", flush=True)
-                time.sleep(0.2)
-                print(".", end="", flush=True)
+                # Tick at the SAME cadence as the running path. Inference keeps firing while
+                # paused, and the measured delay includes the wait for this loop to collect the
+                # result -- so a slower pause loop does not merely idle, it inflates every delay
+                # sample taken while paused and feeds the fiction into the RTC estimate. Measured
+                # on the robot: 0.120 s running became 0.200-0.300 s paused, purely from a 0.2 s
+                # sleep here. `_sleep_remaining` also keeps one definition of the cadence, so this
+                # cannot drift from --action-publish-rate.
+                if time.monotonic() - last_pause_notice >= PAUSE_NOTICE_INTERVAL_S:
+                    print("Paused (policy loop idle, C++ loop still running)", flush=True)
+                    last_pause_notice = time.monotonic()
+                _sleep_remaining(t_start, loop_period)
                 continue
 
             with telemetry.timer("total_loop"):
