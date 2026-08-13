@@ -898,12 +898,25 @@ def main(config: InferenceConfig):
                     # pose message, whose hand fields are dex3 float[7] bound for the C++ loop.
                     # Sending 6-wide values there would raise; sending 7 would command a hand
                     # that is not attached.
-                    if _INSPIRE is not None:
-                        if left_hand_joints is not None and right_hand_joints is not None:
-                            _INSPIRE.write_rad(np.concatenate([
-                                np.asarray(left_hand_joints, np.float32).reshape(-1),
-                                np.asarray(right_hand_joints, np.float32).reshape(-1)]))
-                        left_hand_joints = right_hand_joints = None
+                    if left_hand_joints is not None and right_hand_joints is not None:
+                        lh = np.asarray(left_hand_joints, np.float32).reshape(-1)
+                        rh = np.asarray(right_hand_joints, np.float32).reshape(-1)
+                        if _INSPIRE is not None:
+                            _INSPIRE.write_rad(np.concatenate([lh, rh]))
+                        # Guard on WIDTH, not on the flag: the v4 pose message takes dex3
+                        # float[7] and raises otherwise, so a 6-wide Inspire vector must never
+                        # reach it -- including when --inspire-hands was NOT passed but the
+                        # policy server is serving --hand-actions inspire, which is exactly the
+                        # mismatch that killed a run. Keying this off _INSPIRE trusted the launch
+                        # line over the data.
+                        if lh.shape[-1] != 7 or rh.shape[-1] != 7:
+                            if _INSPIRE is None and not globals().get("_WARNED_HAND_WIDTH"):
+                                globals()["_WARNED_HAND_WIDTH"] = True
+                                print(f"[hands] policy returned {lh.shape[-1]}-wide hand targets "
+                                      "but --inspire-hands is OFF, so they are DISCARDED and the "
+                                      "fingers will not move. Pass --inspire-hands, or serve with "
+                                      "--hand-actions off/dex3.", flush=True)
+                            left_hand_joints = right_hand_joints = None
 
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
