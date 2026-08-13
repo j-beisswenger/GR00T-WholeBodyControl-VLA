@@ -29,6 +29,7 @@ import queue
 import threading
 import time
 
+import pathlib
 import numpy as np
 import tyro
 import zmq
@@ -72,6 +73,11 @@ class InferenceConfig:
     """The port of the Isaac-GR00T PolicyServer."""
 
     # Control
+    inspire_hands: bool = False
+    """Drive Inspire hands over Modbus TCP instead of the dex3-over-ZMQ path this
+    controller ships. Required for Inspire hardware: the C++ loop only commands Dex3."""
+    inspire_hosts: tuple[str, str] = ("192.168.123.210", "192.168.123.211")
+    """Left, right hand Modbus addresses."""
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
@@ -205,6 +211,37 @@ def pack_latent_action_message(
     return pack_pose_message(pose_data, topic="pose", version=4)
 
 
+# --- Inspire hands (Modbus TCP) ------------------------------------------------------
+# This controller addresses hands through the robot MODEL (g1_29dof_with_hand = 7 dex3 slots)
+# and commands them as `float[7] Dex3` over ZMQ to the C++ loop. Inspire hands are 6 DOF and
+# speak Modbus TCP on their own network, so that entire chain misses them: the dex3 slots carry
+# no Inspire reading and the C++ cannot drive an Inspire finger. When --inspire-hands is set we
+# therefore bypass it in BOTH directions -- read the real 6 DOF straight off the hands into the
+# observation, and write the policy's 6 targets straight back -- leaving the body path untouched.
+_INSPIRE = None
+
+
+def _load_inspire_hands():
+    """Import the shared transport from the parent humanoid-vla checkout.
+
+    Deliberately not vendored: a second copy of a register map is exactly the thing that drifts
+    silently. This controller is meant to be driven as humanoid-vla's submodule (see that repo's
+    deploy/real/pi05/RUNBOOK.md), so the parent is on disk; a standalone clone gets a clear error
+    rather than a mysterious ImportError.
+    """
+    import sys
+    repo = pathlib.Path(__file__).resolve().parents[4]      # <humanoid-vla>/deploy/GR00T-.../gear_sonic/scripts
+    if not (repo / "deploy" / "real" / "common" / "inspire_modbus.py").is_file():
+        raise RuntimeError(
+            f"--inspire-hands needs humanoid-vla's deploy/real/common/inspire_modbus.py, "
+            f"expected under {repo}. Run this controller as that repo's submodule."
+        )
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    from deploy.real.common.inspire_modbus import InspireHands
+    return InspireHands
+
+
 def get_action_field(action_dict: dict, key: str, required: bool = True):
     """Get action field from dict, checking both with and without 'action.' prefix.
 
@@ -299,6 +336,15 @@ def prepare_observation_from_sensors(
     }
 
     observation = prepare_observation_for_eval(robot_model, observation)
+
+    # Overwrite the model's 7 dex3 slots with the REAL 6 Inspire DOF. Those slots cannot
+    # represent this hand: the controller's index->middle coupling fill leaves only 5 independent
+    # values, and there is no ring or pinky slot at all -- so there is no 7->6 conversion to
+    # write, only a different source. Downstream (the pi0.5 bridge) dispatches on width.
+    if _INSPIRE is not None:
+        hq = _INSPIRE.read_rad()
+        observation["state"]["left_hand"] = hq[:6][np.newaxis, np.newaxis]
+        observation["state"]["right_hand"] = hq[6:][np.newaxis, np.newaxis]
 
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
@@ -459,6 +505,13 @@ def main(config: InferenceConfig):
     )
 
     telemetry = Telemetry(window_size=100)
+
+    global _INSPIRE
+    if config.inspire_hands:
+        _INSPIRE = _load_inspire_hands()(hosts=config.inspire_hosts).connect()
+        print(f"[inspire] Modbus hands connected: {config.inspire_hosts}", flush=True)
+        print(f"[inspire] initial read (rad, 0=open): "
+              f"{np.round(_INSPIRE.read_rad(), 3).tolist()}", flush=True)
 
     loop_rate = config.action_publish_rate
     loop_period = 1.0 / loop_rate
@@ -841,6 +894,17 @@ def main(config: InferenceConfig):
                         current_idx,
                     )
 
+                    # Inspire: drive the fingers over Modbus and keep them OUT of the v4
+                    # pose message, whose hand fields are dex3 float[7] bound for the C++ loop.
+                    # Sending 6-wide values there would raise; sending 7 would command a hand
+                    # that is not attached.
+                    if _INSPIRE is not None:
+                        if left_hand_joints is not None and right_hand_joints is not None:
+                            _INSPIRE.write_rad(np.concatenate([
+                                np.asarray(left_hand_joints, np.float32).reshape(-1),
+                                np.asarray(right_hand_joints, np.float32).reshape(-1)]))
+                        left_hand_joints = right_hand_joints = None
+
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
 
@@ -882,6 +946,8 @@ def main(config: InferenceConfig):
         zmq_context.term()
         state_subscriber.close()
         keyboard_listener.close()
+        if _INSPIRE is not None:
+            _INSPIRE.close()
         print("Shutdown complete.")
 
 
