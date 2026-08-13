@@ -73,7 +73,7 @@ class InferenceConfig:
     """The port of the Isaac-GR00T PolicyServer."""
 
     # Control
-    inspire_hands: bool = False
+    inspire_hands: bool = True
     """Drive Inspire hands over Modbus TCP instead of the dex3-over-ZMQ path this
     controller ships. Required for Inspire hardware: the C++ loop only commands Dex3."""
     inspire_hosts: tuple[str, str] = ("192.168.123.210", "192.168.123.211")
@@ -508,10 +508,25 @@ def main(config: InferenceConfig):
 
     global _INSPIRE
     if config.inspire_hands:
-        _INSPIRE = _load_inspire_hands()(hosts=config.inspire_hosts).connect()
-        print(f"[inspire] Modbus hands connected: {config.inspire_hosts}", flush=True)
-        print(f"[inspire] initial read (rad, 0=open): "
-              f"{np.round(_INSPIRE.read_rad(), 3).tolist()}", flush=True)
+        # On by default, so it must fail LOUDLY and degrade safely rather than quietly feeding
+        # the policy fiction: read_rad() falls back to the last good value (zeros) on a dropped
+        # packet, which is indistinguishable from a hand held open. probe() is the only honest
+        # reachability answer, so ask it once here and switch the whole path off if it says no.
+        try:
+            hands = _load_inspire_hands()(hosts=config.inspire_hosts).connect()
+            if hands.probe():
+                _INSPIRE = hands
+                print(f"[inspire] Modbus hands connected: {config.inspire_hosts}", flush=True)
+                print(f"[inspire] initial read (rad, 0=open): "
+                      f"{np.round(_INSPIRE.read_rad(), 3).tolist()}", flush=True)
+            else:
+                hands.close()
+                print(f"[inspire] hands did NOT answer at {config.inspire_hosts} -- running "
+                      "WITHOUT hands. Check with `python ../real/common/inspire_modbus.py "
+                      "--check`, or pass --no-inspire-hands to silence this.", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[inspire] hand setup failed ({type(e).__name__}: {e}) -- running WITHOUT "
+                  "hands. Pass --no-inspire-hands to silence this.", flush=True)
 
     loop_rate = config.action_publish_rate
     loop_period = 1.0 / loop_rate

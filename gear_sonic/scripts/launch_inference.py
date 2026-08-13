@@ -129,7 +129,7 @@ class InferenceLaunchConfig:
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
-    inspire_hands: bool = False
+    inspire_hands: bool = True
     """Drive Inspire hands over Modbus TCP (run_vla_inference --inspire-hands). Must be
     forwarded from here: this launcher builds the inference pane from a fixed string, so a
     flag passed to launch_inference.py is otherwise dropped before it reaches the script."""
@@ -394,7 +394,7 @@ def main(config: InferenceLaunchConfig):
         f"--initial-pose-blend-duration {config.initial_pose_blend_duration} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
-        + (" --inspire-hands" if config.inspire_hands else "")
+        + ("" if config.inspire_hands else " --no-inspire-hands")
     )
 
     print("Starting VLA inference (pane 1)...")
