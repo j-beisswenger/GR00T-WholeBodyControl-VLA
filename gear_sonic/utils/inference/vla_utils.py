@@ -29,16 +29,43 @@ def concat_action(robot_model: RobotModel, goal: Dict[str, Any]) -> Dict[str, An
     return processed_goal
 
 
-def prepare_observation_for_eval(robot_model: RobotModel, obs: dict) -> dict:
+# SONIC stance pose per state group, in each group's own joint order. Must stay identical to
+# gr00t/data/sonic_q_convention.py:DEFAULT_ANGLES_BY_GROUP (training) and to
+# deploy/real/common/sonic_constants.py:DEFAULT_MJ (the pi0.5 bridge). These three are the same
+# 29 numbers; a drift between them does not raise, it degrades the state channel silently.
+# Groups absent here are never offset: gravity is a direction, hands are outside the token space.
+DEFAULT_ANGLES_BY_GROUP = {
+    "left_leg": np.array([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0], dtype=np.float32),
+    "right_leg": np.array([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0], dtype=np.float32),
+    "waist": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    "left_arm": np.array([0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0], dtype=np.float32),
+    "right_arm": np.array([0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0], dtype=np.float32),
+}
+
+
+def prepare_observation_for_eval(
+    robot_model: RobotModel, obs: dict, state_q_dev: bool = False
+) -> dict:
     """Split whole-body ``q`` into per-joint-group state keys for the policy.
 
     Populates ``obs["state"]`` with ``left_arm``, ``right_arm``, ``waist``,
     ``left_leg``, ``right_leg``, ``left_hand``, ``right_hand`` sub-keys
     using the nested dict format expected by ``Gr00tPolicy``.
 
+    With ``state_q_dev`` the five body groups are emitted as ``q - default_angles`` rather than
+    raw ``q``. This MUST match how the checkpoint was trained. Models trained after the
+    ``state_q_convention`` change consume q_dev, which is also what the SONIC decoder and the
+    pi0.5 bridge use; the offset is 0.669 rad at the knee and 0.363 at the ankle, so getting it
+    backwards biases exactly the joints that carry balance. It defaults to False because every
+    checkpoint trained before that change consumes absolute q -- flipping the default would break
+    each of them on the next run. Turn it on for models trained with ``state_q_convention`` set.
+
+    Hands are never offset -- the 14 hand DOF are outside the SONIC token space.
+
     Args:
         robot_model: RobotModel instance.
         obs: Observation dict containing ``"q"`` key and a ``"state"`` sub-dict.
+        state_q_dev: Emit body joints as q - default_angles (see above).
 
     Returns:
         Modified observation dict with ``obs["state"]`` populated.
@@ -51,11 +78,16 @@ def prepare_observation_for_eval(robot_model: RobotModel, obs: dict) -> dict:
     if "state" not in obs:
         obs["state"] = {}
 
-    obs["state"]["left_arm"] = whole_q[..., robot_model.get_joint_group_indices("left_arm")]
-    obs["state"]["right_arm"] = whole_q[..., robot_model.get_joint_group_indices("right_arm")]
-    obs["state"]["waist"] = whole_q[..., robot_model.get_joint_group_indices("waist")]
-    obs["state"]["left_leg"] = whole_q[..., robot_model.get_joint_group_indices("left_leg")]
-    obs["state"]["right_leg"] = whole_q[..., robot_model.get_joint_group_indices("right_leg")]
+    for group in ("left_arm", "right_arm", "waist", "left_leg", "right_leg"):
+        values = whole_q[..., robot_model.get_joint_group_indices(group)]
+        if state_q_dev:
+            default = DEFAULT_ANGLES_BY_GROUP[group]
+            assert values.shape[-1] == default.shape[0], (
+                f"state group {group!r} has width {values.shape[-1]}, expected {default.shape[0]}"
+            )
+            values = values - default
+        obs["state"][group] = values
+
     obs["state"]["left_hand"] = whole_q[..., robot_model.get_joint_group_indices("left_hand")]
     obs["state"]["right_hand"] = whole_q[..., robot_model.get_joint_group_indices("right_hand")]
 

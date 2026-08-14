@@ -76,6 +76,12 @@ class InferenceConfig:
     inspire_hands: bool = True
     """Drive Inspire hands over Modbus TCP instead of the dex3-over-ZMQ path this
     controller ships. Required for Inspire hardware: the C++ loop only commands Dex3."""
+
+    state_q_dev: bool = False
+    """Send body joints as q - default_angles instead of raw q. MUST match how the checkpoint
+    was trained. Off by default because every checkpoint trained before the
+    `state_q_convention` loader change consumes absolute q; turn it on for models trained
+    after it. Wrong either way biases the knee by 0.669 rad and the ankle by 0.363."""
     inspire_hosts: tuple[str, str] = ("192.168.123.210", "192.168.123.211")
     """Left, right hand Modbus addresses."""
     action_publish_rate: int = 50
@@ -220,6 +226,11 @@ def pack_latent_action_message(
 # observation, and write the policy's 6 targets straight back -- leaving the body path untouched.
 _INSPIRE = None
 
+# Joint-position convention sent to the policy, set once from InferenceConfig.state_q_dev.
+# Module-global for the same reason _INSPIRE is: the observation is assembled in a helper the
+# control loop calls per tick, with no route for per-run config.
+_STATE_Q_DEV = False
+
 
 def _load_inspire_hands():
     """Import the shared transport from the parent humanoid-vla checkout.
@@ -335,7 +346,7 @@ def prepare_observation_from_sensors(
         "timestamps": camera_msg["timestamps"]["ego_view"],
     }
 
-    observation = prepare_observation_for_eval(robot_model, observation)
+    observation = prepare_observation_for_eval(robot_model, observation, state_q_dev=_STATE_Q_DEV)
 
     # Overwrite the model's 7 dex3 slots with the REAL 6 Inspire DOF. Those slots cannot
     # represent this hand: the controller's index->middle coupling fill leaves only 5 independent
@@ -505,6 +516,13 @@ def main(config: InferenceConfig):
     )
 
     telemetry = Telemetry(window_size=100)
+
+    # Announce the state convention every run: it is invisible in the data and silently wrong
+    # if it disagrees with the checkpoint, so make it impossible to misread the log afterwards.
+    global _STATE_Q_DEV
+    _STATE_Q_DEV = config.state_q_dev
+    print(f"[state] sending body joints as {'q_dev (q - default_angles)' if _STATE_Q_DEV else 'RAW absolute q'}"
+          f" -- this must match how the checkpoint was trained", flush=True)
 
     global _INSPIRE
     if config.inspire_hands:
