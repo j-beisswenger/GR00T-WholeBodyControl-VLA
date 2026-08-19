@@ -24,6 +24,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 """
 
 import collections
+import os
 from dataclasses import dataclass
 import queue
 import threading
@@ -252,6 +253,7 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
+    inspire_reader=None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -308,6 +310,19 @@ def prepare_observation_from_sensors(
     observation["state"]["projected_gravity"] = np.asarray(
         projected_gravity, dtype=np.float32
     )[np.newaxis, np.newaxis]
+
+    # INSPIRE hands: overwrite the dex3-shaped slices with what the hands actually report.
+    # `prepare_observation_for_eval` builds left_hand/right_hand from whole_q, i.e. 7 dex3 slots
+    # fed by the rt/dex3/* topics -- which nothing publishes on a G1 wearing Inspire hands. The
+    # pi0.5 bridge dispatches on width (7 = dex3, 6 = Inspire), so replacing them with the real
+    # 6-DOF vectors is all that is needed for --hand-proprio inspire. Left untouched when the
+    # reader is absent or the hands are unreachable: stale-but-shaped beats a fabricated pose.
+    if inspire_reader is not None:
+        hands = inspire_reader.read()
+        if hands is not None:
+            left6, right6 = hands
+            observation["state"]["left_hand"] = left6[np.newaxis, np.newaxis]
+            observation["state"]["right_hand"] = right6[np.newaxis, np.newaxis]
 
     return observation
 
@@ -424,6 +439,17 @@ def main(config: InferenceConfig):
     pause_loop = True
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
+
+    # INSPIRE hand proprio. Off unless SONIC_INSPIRE_HANDS=1, because it is only correct on a G1
+    # that actually wears Inspire hands: it replaces the (dex3-shaped, unpublished) left_hand /
+    # right_hand state with the 6-DOF vectors read over Modbus. Env-gated rather than a CLI flag
+    # because launch_inference.py builds its pane command from a fixed string.
+    inspire_reader = None
+    if os.environ.get("SONIC_INSPIRE_HANDS", "0") == "1":
+        from gear_sonic.utils.inference.inspire_hands import InspireHandReader
+
+        inspire_reader = InspireHandReader()
+        print("[inspire] hand proprio ENABLED (SONIC_INSPIRE_HANDS=1)", flush=True)
 
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
@@ -701,6 +727,7 @@ def main(config: InferenceConfig):
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
+                inspire_reader=inspire_reader,
             ),
             lambda obs, options=None: run_policy_inference_and_process(
                 policy=n1_policy,
