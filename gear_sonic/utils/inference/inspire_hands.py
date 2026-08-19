@@ -34,6 +34,7 @@ CONVENTIONS (all verified against the sources named, except where flagged)
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 
@@ -41,13 +42,15 @@ LEFT_HOST = os.environ.get("SONIC_INSPIRE_LEFT_HOST", "192.168.123.210")
 RIGHT_HOST = os.environ.get("SONIC_INSPIRE_RIGHT_HOST", "192.168.123.211")
 PORT = int(os.environ.get("SONIC_INSPIRE_PORT", "6000"))
 
-REG_ACTUAL = 1546          # 6 measured finger positions
+REG_ACTUAL = 1546          # 6 measured finger positions (read)
+REG_TARGET = 1486          # 6 finger setpoints (write)
 N_FINGERS = 6
 CTRL_MAX = 1000.0
 
 # Modbus slot -> codec slot. Modbus is [pinky, ring, middle, index, thumb_bend, thumb_rotate];
 # the codec is [thumb_yaw, thumb_bend, index, middle, ring, pinky] -- an exact reversal.
 CODEC_FROM_MODBUS = np.array([5, 4, 3, 2, 1, 0])
+MODBUS_FROM_CODEC = np.argsort(CODEC_FROM_MODBUS)   # the same reversal, written out
 
 # Upper joint limits (rad) in CODEC slot order, read off the G1 mode15 MJCF. Lower limit is 0.
 INSPIRE_LIMIT = np.array([1.1641, 0.5864, 1.4381, 1.4381, 1.4381, 1.4381], np.float32)
@@ -56,6 +59,20 @@ INSPIRE_LIMIT = np.array([1.1641, 0.5864, 1.4381, 1.4381, 1.4381, 1.4381], np.fl
 # value is divided by 2.4 to reach the URDF's proximal convention (see data/README_HAND.md).
 THUMB_BEND_IS_DISTAL = os.environ.get("SONIC_INSPIRE_THUMB_DISTAL", "0") == "1"
 THUMB_BEND_SCALE = 2.4
+
+
+def _rad_to_ctrl(q6) -> np.ndarray:
+    """6 joint angles (rad, codec slot order, 0 = open) -> 6 Modbus registers.
+
+    Exact inverse of `_ctrl_to_rad`: undo the thumb scale if the register is distal, normalise
+    by each joint's limit, then INVERT (0 = closed, 1000 = open) and reorder to Modbus.
+    """
+    q = np.asarray(q6, np.float32)[:N_FINGERS].copy()
+    if THUMB_BEND_IS_DISTAL:
+        q[1] = q[1] * THUMB_BEND_SCALE
+    frac = np.clip(q / INSPIRE_LIMIT, 0.0, 1.0)
+    ctrl = np.rint(CTRL_MAX * (1.0 - frac))[MODBUS_FROM_CODEC]
+    return np.clip(ctrl, 0, CTRL_MAX).astype(int)
 
 
 def _ctrl_to_rad(regs) -> np.ndarray:
@@ -79,6 +96,8 @@ class InspireHandReader:
         self._port = port
         self._clients = None
         self._warned = False
+        self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "25"))
+        self._last_write = 0.0
 
     def _connect(self) -> bool:
         if self._clients is not None:
@@ -123,6 +142,37 @@ class InspireHandReader:
                 return None
             out.append(_ctrl_to_rad(rr.registers))
         return out[0], out[1]
+
+    def write(self, left6, right6) -> bool:
+        """Command both hands. Returns False if the write did not reach the hardware.
+
+        Rate-limited: the control loop publishes at 50 Hz, far faster than these servos need or
+        than Modbus TCP round-trips comfortably sustain, and a backed-up socket would stall the
+        loop it is called from. `SONIC_INSPIRE_WRITE_HZ` (default 25) sets the ceiling; ticks
+        in between are dropped, not queued, so the hands always track the LATEST target.
+        """
+        if not self._connect():
+            return False
+        now = time.monotonic()
+        if now - self._last_write < self._write_period:
+            return True                                   # skipped by design, not a failure
+        self._last_write = now
+        for c, q in zip(self._clients, (left6, right6)):
+            regs = _rad_to_ctrl(q)
+            try:
+                rr = c.write_registers(REG_TARGET, regs.tolist(), slave=1)
+            except Exception as exc:
+                print(f"[inspire] write failed ({exc}); reconnecting", flush=True)
+                self._clients = None
+                return False
+            if rr is not None and getattr(rr, "isError", lambda: False)():
+                self._clients = None
+                return False
+        return True
+
+    def open_hands(self) -> bool:
+        """Park both hands OPEN -- the rest pose the policy's state assumes at episode start."""
+        return self.write(np.zeros(N_FINGERS, np.float32), np.zeros(N_FINGERS, np.float32))
 
     def close(self) -> None:
         for c in self._clients or []:

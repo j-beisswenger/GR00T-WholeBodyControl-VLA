@@ -449,7 +449,9 @@ def main(config: InferenceConfig):
         from gear_sonic.utils.inference.inspire_hands import InspireHandReader
 
         inspire_reader = InspireHandReader()
-        print("[inspire] hand proprio ENABLED (SONIC_INSPIRE_HANDS=1)", flush=True)
+        inspire_reader.open_hands()      # start from REST, as the policy's state assumes
+        print("[inspire] hands ENABLED (SONIC_INSPIRE_HANDS=1): proprio in, targets out",
+              flush=True)
 
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
@@ -870,6 +872,13 @@ def main(config: InferenceConfig):
 
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
+
+                    # INSPIRE hands: the v4 message carries these targets, but the C++ deploy
+                    # only actuates dex3 over DDS -- our hands are Modbus devices, so nothing
+                    # downstream would move them. Drive them here, from the same per-tick target
+                    # that goes on the wire, so the two can never disagree. Rate-limited inside.
+                    if inspire_reader is not None and left_hand_joints is not None:
+                        inspire_reader.write(left_hand_joints, right_hand_joints)
 
                     zmq_message = pack_latent_action_message(
                         motion_token,
