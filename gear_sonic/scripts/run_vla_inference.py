@@ -879,6 +879,13 @@ def main(config: InferenceConfig):
                     # that goes on the wire, so the two can never disagree. Rate-limited inside.
                     if inspire_reader is not None and left_hand_joints is not None:
                         inspire_reader.write(left_hand_joints, right_hand_joints)
+                        # The v4 pose message is dex3-shaped and validates shape [7]; Inspire
+                        # targets are 6 wide, and the C++ deploy could not actuate them anyway
+                        # (dex3 over DDS only). We have just driven the hands over Modbus, so
+                        # drop them from the wire rather than padding a dex3 field with Inspire
+                        # values that would silently mean the wrong joints downstream.
+                        if np.asarray(left_hand_joints).shape[-1] != 7:
+                            left_hand_joints = right_hand_joints = None
 
                     zmq_message = pack_latent_action_message(
                         motion_token,

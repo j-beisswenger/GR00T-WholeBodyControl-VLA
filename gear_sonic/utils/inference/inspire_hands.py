@@ -98,8 +98,14 @@ class InspireHandReader:
         self._warned = False
         self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "25"))
         self._last_write = 0.0
+        self._unit_kw = None      # "slave" (pymodbus 3.x) or "device_id" (4.x); detected once
+        self._fails = 0
+        self._disabled = False
+        self._announced = False
 
     def _connect(self) -> bool:
+        if self._disabled:
+            return False
         if self._clients is not None:
             return True
         try:
@@ -123,8 +129,30 @@ class InspireHandReader:
                 return False
             clients.append(c)
         self._clients = clients
-        print(f"[inspire] hands connected: {self._hosts[0]} / {self._hosts[1]}", flush=True)
+        if self._unit_kw is None:
+            # pymodbus renamed the unit-id argument between 3.x and 4.x. Pick whichever this
+            # install accepts rather than guessing -- the wrong one raises on every call.
+            import inspect
+            params = inspect.signature(ModbusTcpClient.read_holding_registers).parameters
+            self._unit_kw = "device_id" if "device_id" in params else "slave"
+        if not self._announced:
+            print(f"[inspire] hands connected: {self._hosts[0]} / {self._hosts[1]} "
+                  f"(unit kwarg: {self._unit_kw})", flush=True)
+            self._announced = True
         return True
+
+    def _give_up(self, why: str) -> None:
+        """Stop after repeated failures instead of reconnecting on every tick.
+
+        A reconnect storm is worse than being off: it printed a line per tick and eventually
+        got the hands to refuse connections outright.
+        """
+        self._clients = None
+        self._fails += 1
+        if self._fails >= 3 and not self._disabled:
+            self._disabled = True
+            print(f"[inspire] giving up after {self._fails} failures ({why}); hands DISABLED "
+                  "for this run", flush=True)
 
     def read(self):
         if not self._connect():
@@ -132,15 +160,18 @@ class InspireHandReader:
         out = []
         for c in self._clients:
             try:
-                rr = c.read_holding_registers(REG_ACTUAL, count=N_FINGERS, slave=1)
+                rr = c.read_holding_registers(REG_ACTUAL, count=N_FINGERS,
+                                              **{self._unit_kw: 1})
             except Exception as exc:                      # transport hiccup: drop the sample
-                print(f"[inspire] read failed ({exc}); dropping this tick", flush=True)
-                self._clients = None
+                if self._fails == 0:
+                    print(f"[inspire] read failed ({exc})", flush=True)
+                self._give_up(str(exc))
                 return None
             if rr is None or getattr(rr, "isError", lambda: True)():
-                self._clients = None
+                self._give_up("modbus error response")
                 return None
             out.append(_ctrl_to_rad(rr.registers))
+        self._fails = 0
         return out[0], out[1]
 
     def write(self, left6, right6) -> bool:
@@ -160,13 +191,14 @@ class InspireHandReader:
         for c, q in zip(self._clients, (left6, right6)):
             regs = _rad_to_ctrl(q)
             try:
-                rr = c.write_registers(REG_TARGET, regs.tolist(), slave=1)
+                rr = c.write_registers(REG_TARGET, regs.tolist(), **{self._unit_kw: 1})
             except Exception as exc:
-                print(f"[inspire] write failed ({exc}); reconnecting", flush=True)
-                self._clients = None
+                if self._fails == 0:
+                    print(f"[inspire] write failed ({exc})", flush=True)
+                self._give_up(str(exc))
                 return False
             if rr is not None and getattr(rr, "isError", lambda: False)():
-                self._clients = None
+                self._give_up("modbus error response")
                 return False
         return True
 
