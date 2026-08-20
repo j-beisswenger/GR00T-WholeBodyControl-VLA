@@ -431,8 +431,8 @@ class GrootDataCollector:
         # here and return; the body half of the action is already recovered from the C++ telemetry
         # echo (`proprio["token_state"]`), so only the hands are new.
         if "token_state" in pose_data and "smpl_joints" not in pose_data:
-            left = self._extract_hand_joints(pose_data, "left_hand_joints")
-            right = self._extract_hand_joints(pose_data, "right_hand_joints")
+            left = self._extract_hand_joints(pose_data, "vla_left_hand_joints")
+            right = self._extract_hand_joints(pose_data, "vla_right_hand_joints")
             if left is not None or right is not None:
                 # Width IS the hand space: 7 = dex3, 6 = Inspire. Recorded alongside the values
                 # because the two mean different joints and the column is a fixed 7 wide.

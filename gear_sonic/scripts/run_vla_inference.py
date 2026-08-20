@@ -189,8 +189,15 @@ def pack_latent_action_message(
     # message and a VLA run has no teleop stream to fall back on. Rejecting 6 here is what left
     # `teleop.left/right_hand_joints` all-zero in every recorded VLA episode: the caller nulled
     # them rather than crash, so the policy's own hand commands were never written down.
-    for name, val in (("left_hand_joints", left_hand_joints),
-                      ("right_hand_joints", right_hand_joints)):
+    #
+    # Sent under `vla_*` names, NOT `left_hand_joints`. The C++ ZMQEndpointInterface validates
+    # the canonical names against its dex3 shape and logs two lines per tick when they are 6
+    # wide -- at 50 Hz that is 100 lines/s of stderr inside a realtime control loop, which is a
+    # cost the loop should not pay for a field it then discards. Unknown field names are skipped
+    # by the header walk without comment, so the values reach the exporter and the controller
+    # never sees them.
+    for name, val in (("vla_left_hand_joints", left_hand_joints),
+                      ("vla_right_hand_joints", right_hand_joints)):
         if val is None:
             continue
         val = np.asarray(val, dtype=np.float32)
