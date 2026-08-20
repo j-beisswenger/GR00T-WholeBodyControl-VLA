@@ -445,6 +445,7 @@ def main(config: InferenceConfig):
     # right_hand state with the 6-DOF vectors read over Modbus. Env-gated rather than a CLI flag
     # because launch_inference.py builds its pane command from a fixed string.
     inspire_reader = None
+    warned_hand_width = False
     if os.environ.get("SONIC_INSPIRE_HANDS", "0") == "1":
         from gear_sonic.utils.inference.inspire_hands import InspireHandReader
 
@@ -879,13 +880,21 @@ def main(config: InferenceConfig):
                     # that goes on the wire, so the two can never disagree. Rate-limited inside.
                     if inspire_reader is not None and left_hand_joints is not None:
                         inspire_reader.write(left_hand_joints, right_hand_joints)
-                        # The v4 pose message is dex3-shaped and validates shape [7]; Inspire
-                        # targets are 6 wide, and the C++ deploy could not actuate them anyway
-                        # (dex3 over DDS only). We have just driven the hands over Modbus, so
-                        # drop them from the wire rather than padding a dex3 field with Inspire
-                        # values that would silently mean the wrong joints downstream.
-                        if np.asarray(left_hand_joints).shape[-1] != 7:
-                            left_hand_joints = right_hand_joints = None
+
+                    # The v4 pose message is dex3-shaped and validates shape [7]; a server on
+                    # --hand-actions inspire returns 6. Drop them rather than padding a dex3
+                    # field with Inspire values that would mean the wrong joints downstream.
+                    # NOT conditional on the reader: the server's action width is set by ITS
+                    # flags, so without this a mismatched pair of flags crashes the publish loop
+                    # (it did: "left_hand_joints must have shape [7], got (6,)").
+                    if (left_hand_joints is not None
+                            and np.asarray(left_hand_joints).shape[-1] != 7):
+                        if inspire_reader is None and not warned_hand_width:
+                            print("[inspire] server is sending 6-DOF Inspire hand targets but "
+                                  "SONIC_INSPIRE_HANDS is not set, so nothing drives the hands "
+                                  "-- dropping them from the wire", flush=True)
+                            warned_hand_width = True
+                        left_hand_joints = right_hand_joints = None
 
                     zmq_message = pack_latent_action_message(
                         motion_token,
