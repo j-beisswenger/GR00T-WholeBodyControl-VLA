@@ -377,9 +377,17 @@ def main(config: InferenceLaunchConfig):
         _send_to_pane(3, exporter_cmd, wait=2.0)
 
     # --- Pane 1 (top-right): VLA Inference ---
+    # SONIC_INSPIRE_HANDS has to be re-exported INTO the pane. Panes are fresh shells under the
+    # tmux server, which inherits its environment from whoever started the server -- not from
+    # this process. So `SONIC_INSPIRE_HANDS=1 python launch_inference.py` reached the hands only
+    # when the launcher happened to start the server too; against an already-running tmux server
+    # it silently did not, the Inspire reader was never constructed, and the policy got the
+    # all-zero dex3 slots as hand proprio with no error anywhere.
+    inspire = os.environ.get("SONIC_INSPIRE_HANDS", "0")
     inference_cmd = (
         f"cd {repo_root} && "
         f"source .venv_inference/bin/activate && "
+        f"export SONIC_INSPIRE_HANDS={inspire} && "
         f"python gear_sonic/scripts/run_vla_inference.py "
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "
