@@ -183,25 +183,24 @@ def pack_latent_action_message(
         "frame_index": frame_index,
     }
 
-    if left_hand_joints is not None:
-        left_hand_joints = np.asarray(left_hand_joints, dtype=np.float32)
-        if left_hand_joints.ndim == 1:
-            if left_hand_joints.shape[0] != 7:
+    # WIDTH 6 OR 7. 7 = dex3, the space the C++ deploy actuates over DDS. 6 = Inspire, which
+    # nothing downstream actuates (those hands are Modbus, driven in this process) -- but the
+    # values still have to travel, because the data exporter reads its hand columns off this
+    # message and a VLA run has no teleop stream to fall back on. Rejecting 6 here is what left
+    # `teleop.left/right_hand_joints` all-zero in every recorded VLA episode: the caller nulled
+    # them rather than crash, so the policy's own hand commands were never written down.
+    for name, val in (("left_hand_joints", left_hand_joints),
+                      ("right_hand_joints", right_hand_joints)):
+        if val is None:
+            continue
+        val = np.asarray(val, dtype=np.float32)
+        if val.ndim == 1:
+            if val.shape[0] not in (6, 7):
                 raise ValueError(
-                    f"left_hand_joints must have shape [7], got {left_hand_joints.shape}"
+                    f"{name} must have shape [6] (Inspire) or [7] (dex3), got {val.shape}"
                 )
-            left_hand_joints = left_hand_joints.reshape(1, 7)
-        pose_data["left_hand_joints"] = left_hand_joints
-
-    if right_hand_joints is not None:
-        right_hand_joints = np.asarray(right_hand_joints, dtype=np.float32)
-        if right_hand_joints.ndim == 1:
-            if right_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"right_hand_joints must have shape [7], got {right_hand_joints.shape}"
-                )
-            right_hand_joints = right_hand_joints.reshape(1, 7)
-        pose_data["right_hand_joints"] = right_hand_joints
+            val = val.reshape(1, -1)
+        pose_data[name] = val
 
     return pack_pose_message(pose_data, topic="pose", version=4)
 
@@ -881,20 +880,20 @@ def main(config: InferenceConfig):
                     if inspire_reader is not None and left_hand_joints is not None:
                         inspire_reader.write(left_hand_joints, right_hand_joints)
 
-                    # The v4 pose message is dex3-shaped and validates shape [7]; a server on
-                    # --hand-actions inspire returns 6. Drop them rather than padding a dex3
-                    # field with Inspire values that would mean the wrong joints downstream.
-                    # NOT conditional on the reader: the server's action width is set by ITS
-                    # flags, so without this a mismatched pair of flags crashes the publish loop
-                    # (it did: "left_hand_joints must have shape [7], got (6,)").
+                    # 6-DOF Inspire targets now RIDE the v4 message (pack_latent_action_message
+                    # takes 6 or 7). Nothing downstream actuates them -- the C++ deploy drives
+                    # dex3 over DDS and these hands are Modbus, already written above -- but the
+                    # data exporter reads its hand columns off this message, so dropping them is
+                    # what made `teleop.left/right_hand_joints` all-zero in every VLA recording.
+                    # The width travels with the values, so a consumer can tell the two spaces
+                    # apart; see run_data_exporter._vla_hand_joints.
                     if (left_hand_joints is not None
-                            and np.asarray(left_hand_joints).shape[-1] != 7):
-                        if inspire_reader is None and not warned_hand_width:
-                            print("[inspire] server is sending 6-DOF Inspire hand targets but "
-                                  "SONIC_INSPIRE_HANDS is not set, so nothing drives the hands "
-                                  "-- dropping them from the wire", flush=True)
-                            warned_hand_width = True
-                        left_hand_joints = right_hand_joints = None
+                            and np.asarray(left_hand_joints).shape[-1] == 6
+                            and inspire_reader is None and not warned_hand_width):
+                        print("[inspire] server is sending 6-DOF Inspire hand targets but "
+                              "SONIC_INSPIRE_HANDS is not set, so nothing drives the hands "
+                              "-- recording them, not actuating them", flush=True)
+                        warned_hand_width = True
 
                     zmq_message = pack_latent_action_message(
                         motion_token,
