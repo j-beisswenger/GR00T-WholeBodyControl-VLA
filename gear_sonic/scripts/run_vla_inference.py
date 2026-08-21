@@ -253,6 +253,47 @@ def select_action_step(array, index: int):
 # ---------------------------------------------------------------------------
 
 
+
+_BODY_GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")   # 6+6+3+7+7 = 29
+_DEFAULT_MJ = None
+
+
+def _to_q_dev(observation):
+    """Subtract the SONIC stance from the body groups, in place.
+
+    WHY: the GR00T checkpoints are trained on q_dev. `roboxperience_converter/convert.py`
+    writes `observation.state = remap(q_dev)[29] + gravity_body[3]`, with
+    `q_dev = q_il - DEFAULT_ANGLES_IL`, and their dataset statistics agree (knee mean -0.046,
+    not the +0.669 an absolute stance reads). Nothing in the GR00T serving path subtracts it --
+    unlike pi0.5, whose bridge does it in `build_state32` -- so the robot has to.
+
+    Groups only, never gravity or the hands. Each group already arrives in SONIC intra-group
+    order, so concatenating the five is exactly the DEFAULT_MJ layout: no permutation.
+
+    NB the SONIC DECODER's own 994-d observation is a different vector and is already
+    stance-subtracted by the C++ deploy; this does not touch it.
+    """
+    global _DEFAULT_MJ
+    if _DEFAULT_MJ is None:
+        import sys
+        repo = pathlib.Path(__file__).resolve().parents[5]        # .../humanoid-vla
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from deploy.real.common.sonic_constants import DEFAULT_MJ
+        _DEFAULT_MJ = DEFAULT_MJ
+    off = 0
+    for g in _BODY_GROUPS:
+        v = observation["state"].get(g)
+        if v is None:
+            raise KeyError(f"SONIC_STATE_Q=dev needs observation['state']['{g}']")
+        n = np.asarray(v).shape[-1]
+        observation["state"][g] = np.asarray(v, np.float32) - _DEFAULT_MJ[off:off + n]
+        off += n
+    if off != 29:
+        raise ValueError(f"body groups summed to {off} dof, expected 29")
+    return observation
+
+
 def prepare_observation_from_sensors(
     camera_subscriber,
     state_subscriber,
@@ -338,6 +379,9 @@ def prepare_observation_from_sensors(
                 left, right = left6, right6
             observation["state"]["left_hand"] = left[np.newaxis, np.newaxis]
             observation["state"]["right_hand"] = right[np.newaxis, np.newaxis]
+
+    if os.environ.get("SONIC_STATE_Q", "absolute") == "dev":
+        observation = _to_q_dev(observation)
 
     return observation
 

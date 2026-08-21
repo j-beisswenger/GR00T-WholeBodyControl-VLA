@@ -391,6 +391,8 @@ def main(config: InferenceLaunchConfig):
     # by not sending the plan at all.
     # inspire (default, pi0.5: the bridge retargets) | dex3 (GR00T: we retarget here)
     hand_space = os.environ.get("SONIC_HAND_SPACE", "inspire")
+    # absolute (pi0.5: the bridge subtracts DEFAULT_MJ) | dev (GR00T: nothing does)
+    state_q = os.environ.get("SONIC_STATE_Q", "absolute")
     rtc_flag = "" if os.environ.get("SONIC_RTC", "1") != "0" else "--no-rtc "
     if rtc_flag:
         print("[rtc] SONIC_RTC=0 -> passing --no-rtc; the robot will not send its executing plan")
@@ -399,6 +401,7 @@ def main(config: InferenceLaunchConfig):
         f"source .venv_inference/bin/activate && "
         f"export SONIC_INSPIRE_HANDS={inspire} && "
         f"export SONIC_HAND_SPACE={hand_space} && "
+        f"export SONIC_STATE_Q={state_q} && "
         f"python gear_sonic/scripts/run_vla_inference.py "
         f"{rtc_flag}"
         f"--host {config.policy_host} "
