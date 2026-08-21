@@ -85,6 +85,21 @@ def _ctrl_to_rad(regs) -> np.ndarray:
     return q.astype(np.float32)
 
 
+def _humanoid_vla_root():
+    """Walk up to the humanoid-vla checkout that holds the shared deploy constants.
+
+    Searched rather than counted: this file and inspire_hands.py sit at different depths, and
+    a hardcoded parents[N] silently resolves to the wrong directory from one of them.
+    """
+    here = pathlib.Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "deploy" / "real" / "common" / "sonic_constants.py").exists():
+            return cand
+    raise RuntimeError(
+        f"cannot find the humanoid-vla root above {here}; SONIC_STATE_Q=dev and "
+        "SONIC_HAND_SPACE=dex3 both need deploy/real/common from the parent repo")
+
+
 _CODEC = None
 
 
@@ -106,7 +121,7 @@ def to_dex3(left6, right6):
     global _CODEC
     if _CODEC is None:
         import sys
-        repo = pathlib.Path(__file__).resolve().parents[5]   # .../humanoid-vla
+        repo = _humanoid_vla_root()
         if str(repo) not in sys.path:
             sys.path.insert(0, str(repo))
         from deploy.real.common.hand_codec import HandCodec

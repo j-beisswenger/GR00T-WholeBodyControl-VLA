@@ -255,6 +255,21 @@ def select_action_step(array, index: int):
 
 
 
+def _humanoid_vla_root():
+    """Walk up to the humanoid-vla checkout that holds the shared deploy constants.
+
+    Searched rather than counted: this file and inspire_hands.py sit at different depths, and
+    a hardcoded parents[N] silently resolves to the wrong directory from one of them.
+    """
+    here = pathlib.Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "deploy" / "real" / "common" / "sonic_constants.py").exists():
+            return cand
+    raise RuntimeError(
+        f"cannot find the humanoid-vla root above {here}; SONIC_STATE_Q=dev and "
+        "SONIC_HAND_SPACE=dex3 both need deploy/real/common from the parent repo")
+
+
 _BODY_GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")   # 6+6+3+7+7 = 29
 _DEFAULT_MJ = None
 
@@ -277,7 +292,7 @@ def _to_q_dev(observation):
     global _DEFAULT_MJ
     if _DEFAULT_MJ is None:
         import sys
-        repo = pathlib.Path(__file__).resolve().parents[5]        # .../humanoid-vla
+        repo = _humanoid_vla_root()
         if str(repo) not in sys.path:
             sys.path.insert(0, str(repo))
         from deploy.real.common.sonic_constants import DEFAULT_MJ
