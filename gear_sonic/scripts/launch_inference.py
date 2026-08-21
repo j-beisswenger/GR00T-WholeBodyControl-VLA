@@ -389,6 +389,8 @@ def main(config: InferenceLaunchConfig):
     # rtc_action_prefix from whatever the robot sends, pinning a model that never saw a clean
     # prefix -- silently (gr00t_policy._announce_rtc says so). The only place to stop it is here,
     # by not sending the plan at all.
+    # inspire (default, pi0.5: the bridge retargets) | dex3 (GR00T: we retarget here)
+    hand_space = os.environ.get("SONIC_HAND_SPACE", "inspire")
     rtc_flag = "" if os.environ.get("SONIC_RTC", "1") != "0" else "--no-rtc "
     if rtc_flag:
         print("[rtc] SONIC_RTC=0 -> passing --no-rtc; the robot will not send its executing plan")
@@ -396,6 +398,7 @@ def main(config: InferenceLaunchConfig):
         f"cd {repo_root} && "
         f"source .venv_inference/bin/activate && "
         f"export SONIC_INSPIRE_HANDS={inspire} && "
+        f"export SONIC_HAND_SPACE={hand_space} && "
         f"python gear_sonic/scripts/run_vla_inference.py "
         f"{rtc_flag}"
         f"--host {config.policy_host} "

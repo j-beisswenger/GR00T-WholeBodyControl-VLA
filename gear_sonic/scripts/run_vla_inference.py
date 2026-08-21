@@ -327,8 +327,17 @@ def prepare_observation_from_sensors(
         hands = inspire_reader.read()
         if hands is not None:
             left6, right6 = hands
-            observation["state"]["left_hand"] = left6[np.newaxis, np.newaxis]
-            observation["state"]["right_hand"] = right6[np.newaxis, np.newaxis]
+            if os.environ.get("SONIC_HAND_SPACE", "inspire") == "dex3":
+                # GR00T handtoken checkpoints want 7 dex3 joints per hand and their server does
+                # no retargeting; pi0.5's bridge does it itself from the 6-DOF vector. Same
+                # codec either way -- only the side that calls it differs.
+                from gear_sonic.utils.inference.inspire_hands import to_dex3
+
+                left, right = to_dex3(left6, right6)
+            else:
+                left, right = left6, right6
+            observation["state"]["left_hand"] = left[np.newaxis, np.newaxis]
+            observation["state"]["right_hand"] = right[np.newaxis, np.newaxis]
 
     return observation
 

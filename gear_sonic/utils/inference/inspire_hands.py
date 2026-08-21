@@ -34,6 +34,7 @@ CONVENTIONS (all verified against the sources named, except where flagged)
 from __future__ import annotations
 
 import os
+import pathlib
 import time
 
 import numpy as np
@@ -82,6 +83,37 @@ def _ctrl_to_rad(regs) -> np.ndarray:
     if THUMB_BEND_IS_DISTAL:
         q[1] = q[1] / THUMB_BEND_SCALE
     return q.astype(np.float32)
+
+
+_CODEC = None
+
+
+def to_dex3(left6, right6):
+    """Inspire (6+6, joint convention) -> the 14-d dex3 vector, split 7 + 7.
+
+    The GR00T handtoken checkpoints declare `left_hand`/`right_hand` as **7 dex3 joints** (state
+    46 = 29 body + gravity(3) + 7 + 7), and their server consumes the state groups directly --
+    there is no bridge to retarget for us, unlike pi0.5's `--hand-proprio inspire`. So do the
+    same retarget here: encode the live Inspire pose, decode it in dex3 space. Identical call to
+    the one the pi0.5 bridge makes, and identical to how training built the block
+    (`_dex3_current`: decode the hand token with the dex3 decoder, frame 0).
+
+    ORDER: the returned vector is the codec's INDEX-FIRST dex3 order, which is what the HE
+    corpora store (`data/README_HAND.md`: "Humanoid-Everyday observation.state[:, 29:43] is
+    already in the right order"). It is NOT permuted to the robot's thumb-first URDF order --
+    these values never came from the robot's joints, they were generated in codec space.
+    """
+    global _CODEC
+    if _CODEC is None:
+        import sys
+        repo = pathlib.Path(__file__).resolve().parents[5]   # .../humanoid-vla
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from deploy.real.common.hand_codec import HandCodec
+        _CODEC = HandCodec()
+    d = _CODEC.inspire_to_dex3(np.concatenate([np.asarray(left6, np.float32),
+                                               np.asarray(right6, np.float32)]))
+    return d[:7].astype(np.float32), d[7:].astype(np.float32)
 
 
 class InspireHandReader:
