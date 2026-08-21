@@ -25,6 +25,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 
 import collections
 import os
+import pathlib
 from dataclasses import dataclass
 import queue
 import threading
