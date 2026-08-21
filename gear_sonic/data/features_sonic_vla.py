@@ -303,6 +303,14 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (7,),
             "names": "right_hand_joints",
         },
+        # How many of the 7 commanded hand slots are real: 7 = dex3, 6 = Inspire (slot 6 is
+        # zero padding), 0 = nothing commanded. The two hand spaces mean different joints, so
+        # a fixed-width column is ambiguous without this.
+        "action.hand_dof": {
+            "dtype": "int32",
+            "shape": (1,),
+            "names": ["hand_dof"],
+        },
         "teleop.smpl_frame_index": {
             "dtype": "int64",
             "shape": (1,),

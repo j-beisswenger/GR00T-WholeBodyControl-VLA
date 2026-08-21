@@ -244,6 +244,9 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        # Commanded hand joints from the VLA's v4 latent-action message. Declared here rather
+        # than created on first message so the frame fill can read it unconditionally.
+        self.latest_vla_hand_msg = None
 
         self.current_stream_mode = 0
 
@@ -419,6 +422,27 @@ class GrootDataCollector:
             pose_data = unpack_pose_message(raw, topic="pose")
         except Exception as e:
             print(f"[Sonic] Error unpacking pose message: {e}")
+            return
+
+        # VLA latent-action message (protocol v4, from run_vla_inference.pack_latent_action_message)
+        # shares this topic but carries no SMPL fields, so it used to be dropped by the guard
+        # below -- which is why `teleop.left/right_hand_joints` came out all-zero in every recorded
+        # VLA episode: the policy's hand commands were on the wire and nobody read them. Handle it
+        # here and return; the body half of the action is already recovered from the C++ telemetry
+        # echo (`proprio["token_state"]`), so only the hands are new.
+        if "token_state" in pose_data and "smpl_joints" not in pose_data:
+            left = self._extract_hand_joints(pose_data, "vla_left_hand_joints")
+            right = self._extract_hand_joints(pose_data, "vla_right_hand_joints")
+            if left is not None or right is not None:
+                # Width IS the hand space: 7 = dex3, 6 = Inspire. Recorded alongside the values
+                # because the two mean different joints and the column is a fixed 7 wide.
+                dof = len(left) if left is not None else len(right)
+                self.latest_vla_hand_msg = {
+                    "left_hand_joints": left,
+                    "right_hand_joints": right,
+                    "hand_dof": dof,
+                    "receive_timestamp": time.time(),
+                }
             return
 
         try:
@@ -748,22 +772,34 @@ class GrootDataCollector:
             else np.array([0], dtype=np.int64)
         )
 
-        hand_msg = (
+        # VLA hand targets WIN over the teleop streams when present: in a policy run there is no
+        # teleop stream at all, so the old order fell through to zeros. They are still written to
+        # the `teleop.*` columns rather than new ones, so every existing reader picks them up
+        # unchanged -- the column means "commanded hand joints", whoever commanded them.
+        vla_hand_msg = self.latest_vla_hand_msg
+        hand_msg = vla_hand_msg if vla_hand_msg is not None else (
             smpl_msg if self.current_stream_mode in (1, 4) and smpl_msg is not None
             else planner_msg if planner_msg is not None
             else smpl_msg
         )
-        frame_data["teleop.left_hand_joints"] = (
-            hand_msg["left_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("left_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
-        )
-        frame_data["teleop.right_hand_joints"] = (
-            hand_msg["right_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("right_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
+
+        def _hand(side: str) -> np.ndarray:
+            """(7,) commanded joints. Inspire sends 6; right-pad rather than write NaN, which
+            would poison the episode stats LeRobot computes over this column. `action.hand_dof`
+            says how many of the 7 are real, so the padding is never mistaken for a joint."""
+            if hand_msg is None or hand_msg.get(side) is None:
+                return np.zeros(7, dtype=np.float32)
+            v = np.asarray(hand_msg[side], dtype=np.float32).reshape(-1)
+            if v.shape[0] >= 7:
+                return v[:7]
+            return np.pad(v, (0, 7 - v.shape[0]))
+
+        frame_data["teleop.left_hand_joints"] = _hand("left_hand_joints")
+        frame_data["teleop.right_hand_joints"] = _hand("right_hand_joints")
+        frame_data["action.hand_dof"] = np.array(
+            [int(hand_msg["hand_dof"]) if hand_msg is not None and "hand_dof" in hand_msg
+             else (0 if hand_msg is None else 7)],
+            dtype=np.int32,
         )
 
         # Planner command fields

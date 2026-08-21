@@ -23,6 +23,9 @@ This codebase serves as the foundation for:
 News
 ----
 
+- **[06/16]** **Isaac Teleop Setup (CloudXR / DeviceIO, in-process)** — added bring-up docs for the in-process CloudXR path via ``isaacteleop[cloudxr]``, with no separate publisher container. See `Isaac Teleop Setup <tutorials/isaac_teleop_publisher_setup.html>`_.
+- **[2026-06-16]** **Low-latency teleoperation checkpoint** — released a SONIC checkpoint with 4-frame SMPL reference lookahead for more responsive whole-body teleoperation. See the `Model Card <model_card.html>`_, `Download Models <getting_started/download_models.html#low-latency-teleoperation-checkpoint>`_, and `VLA Inference <tutorials/vla_inference.html#low-latency-teleoperation-checkpoint>`_ for usage.
+- **[2026-05-07]** **End-to-end VLA workflow on G1** — collect teleop data, fine-tune Isaac-GR00T N1.7, and deploy with SONIC whole-body control. See `Data Collection <tutorials/data_collection.html>`_, `VLA Workflow <tutorials/vla_workflow.html>`_, and `VLA Inference <tutorials/vla_inference.html>`_.
 - **[2026-04-14]** `Live web demo <https://nvlabs.github.io/GEAR-SONIC/demo.html>`_ — try SONIC interactively in your browser. Features `Kimodo <https://github.com/nv-tlabs/kimodo>`_ text-to-motion generation.
 - **[2026-04-10]** Released **SONIC training code and checkpoint** on `HuggingFace <https://huggingface.co/nvidia/GEAR-SONIC>`_. Train from scratch or finetune. **Additional embodiment support** and **VLA data collection pipeline**. See `Training Guide <user_guide/training.html>`_.
 - **[2026-03-24]** C++ inference stack update: motor error monitoring, TTS alerts, ZMQ protocol v4, idle-mode readaptation. **ZMQ header size changed to 1280 bytes.**
@@ -76,6 +79,7 @@ Documentation
    :maxdepth: 2
    :caption: Getting Started
 
+   model_card
    getting_started/installation_deploy
    getting_started/download_models
    getting_started/quickstart
@@ -89,8 +93,11 @@ Documentation
    tutorials/gamepad
    tutorials/zmq
    tutorials/manager
+   tutorials/isaac_teleop_publisher_setup
    tutorials/vr_wholebody_teleop
    tutorials/data_collection
+   tutorials/vla_workflow
+   tutorials/vla_inference
 
 .. toctree::
    :maxdepth: 2
