@@ -384,11 +384,20 @@ def main(config: InferenceLaunchConfig):
     # it silently did not, the Inspire reader was never constructed, and the policy got the
     # all-zero dex3 slots as hand proprio with no error anywhere.
     inspire = os.environ.get("SONIC_INSPIRE_HANDS", "0")
+    # SONIC_RTC=0 serves a checkpoint that was never trained for real-time chunking. The server
+    # cannot opt out for us: with rtc_max_delay=0 it skips the trained-range clamp but still sets
+    # rtc_action_prefix from whatever the robot sends, pinning a model that never saw a clean
+    # prefix -- silently (gr00t_policy._announce_rtc says so). The only place to stop it is here,
+    # by not sending the plan at all.
+    rtc_flag = "" if os.environ.get("SONIC_RTC", "1") != "0" else "--no-rtc "
+    if rtc_flag:
+        print("[rtc] SONIC_RTC=0 -> passing --no-rtc; the robot will not send its executing plan")
     inference_cmd = (
         f"cd {repo_root} && "
         f"source .venv_inference/bin/activate && "
         f"export SONIC_INSPIRE_HANDS={inspire} && "
         f"python gear_sonic/scripts/run_vla_inference.py "
+        f"{rtc_flag}"
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "
         f"--embodiment-tag {config.embodiment_tag} "
