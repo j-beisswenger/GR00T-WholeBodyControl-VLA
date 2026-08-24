@@ -310,6 +310,48 @@ def _to_q_dev(observation):
     return observation
 
 
+_EGO_VIDEO_FRAMES = None       # cached list of (H, W, 3) uint8 frames, or None until loaded
+_EGO_VIDEO_START = None        # time.monotonic() reference; None until armed
+_EGO_VIDEO_DT = 1.0 / 50.0     # frames are 1:1 with 50 Hz ticks in the converted corpora
+
+
+def _ego_video_frame():
+    """SONIC_EGO_VIDEO set -> the frame the elapsed wall clock selects, looping; else None.
+
+    Diagnostic override: replaces the REAL camera's ego_view with a recorded episode's ego
+    track, so "does the checkpoint work at all on its own training scene" can be tested
+    independently of "does it work in THIS office" -- body, hands, decoder, everything else
+    stays live and real. Mirrors deploy/sim/pi05/run_vla.py --image-video (same loop, same 50 Hz
+    frame convention), but time- rather than tick-driven: this script's worker thread polls the
+    camera independently of the VLA's replan rate, so there is no tick counter to index by.
+
+    Loaded once, on first use. The clock is armed on first read and re-armed by
+    `reset_ego_video_clock()`, called from the 'i' key handler -- so each initial-pose cycle
+    replays the episode from frame 0, the same trial boundary the real camera would see reset.
+    """
+    global _EGO_VIDEO_FRAMES, _EGO_VIDEO_START
+    path = os.environ.get("SONIC_EGO_VIDEO")
+    if not path:
+        return None
+    if _EGO_VIDEO_FRAMES is None:
+        import imageio.v2 as imageio
+
+        _EGO_VIDEO_FRAMES = [np.asarray(f, np.uint8)[..., :3] for f in imageio.get_reader(path)]
+        print(f"[ego-video] {path}: {len(_EGO_VIDEO_FRAMES)} frames loaded "
+              f"({len(_EGO_VIDEO_FRAMES) * _EGO_VIDEO_DT:.1f} s at the corpus's 50 Hz "
+              "convention); overriding the real camera's ego_view", flush=True)
+    if _EGO_VIDEO_START is None:
+        _EGO_VIDEO_START = time.monotonic()
+    idx = int((time.monotonic() - _EGO_VIDEO_START) / _EGO_VIDEO_DT) % len(_EGO_VIDEO_FRAMES)
+    return _EGO_VIDEO_FRAMES[idx]
+
+
+def reset_ego_video_clock():
+    """Restart the SONIC_EGO_VIDEO override at frame 0. No-op if it is not set."""
+    global _EGO_VIDEO_START
+    _EGO_VIDEO_START = None
+
+
 def prepare_observation_from_sensors(
     camera_subscriber,
     state_subscriber,
@@ -336,6 +378,9 @@ def prepare_observation_from_sensors(
         return None
 
     cam_img = camera_msg["images"]["ego_view"]
+    ego_override = _ego_video_frame()
+    if ego_override is not None:
+        cam_img = ego_override
 
     # Copy index finger data to middle finger (hardware coupling)
     state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
@@ -750,6 +795,7 @@ def main(config: InferenceConfig):
             zmq_frame_counter = 0
             cached_action_chunk = None
             action_chunk_index = 0
+            reset_ego_video_clock()
             print("Cleared cached action chunk, reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
