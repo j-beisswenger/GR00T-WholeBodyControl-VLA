@@ -44,7 +44,10 @@ from gear_sonic.utils.data_collection.keyboard_subscriber import (
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
-from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.initial_poses import (  # noqa: E402
+    LATENT_INITIAL_MOTION_TOKEN,
+    LATENT_INITIAL_MOTION_TOKEN_V1_1,
+)
 from gear_sonic.utils.inference.vla_utils import (
     build_prev_chunk_tail,
     calculate_latency_compensated_index,
@@ -279,6 +282,13 @@ _BODY_GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")   # 6
 # v1.0 body-only checkpoint, just renamed columns, so this cannot be handled by a new
 # --embodiment-tag; the server reads modality_configs per-checkpoint, not from a static registry.
 _STATE_SUFFIX = os.environ.get("SONIC_STATE_SUFFIX", "")
+# SONIC_VERSION selects the 'i'-key idle token: it is a point in ONE SONIC checkpoint's latent
+# space (initial_poses.py's own warning) and means nothing to a different decoder. Must match
+# whichever decoder deploy.sh is actually running (--cp/--obs-config), not the VLA checkpoint's
+# training data version -- those decode.sh flags are what decides the C++ decoder in force.
+_INITIAL_TOKEN = (LATENT_INITIAL_MOTION_TOKEN_V1_1
+                  if os.environ.get("SONIC_VERSION", "v1.0") == "v1.1"
+                  else LATENT_INITIAL_MOTION_TOKEN)
 _MOTION_TOKEN_KEY = os.environ.get("SONIC_ACTION_KEY", "motion_token")
 _DEFAULT_MJ = None
 
@@ -711,7 +721,7 @@ def main(config: InferenceConfig):
             else np.zeros(7, dtype=np.float32)
         )
         zmq_message = pack_latent_action_message(
-            motion_token=LATENT_INITIAL_MOTION_TOKEN,
+            motion_token=_INITIAL_TOKEN,
             frame_index=np.array([0], dtype=np.int64),
             left_hand_joints=left_hand,
             right_hand_joints=right_hand,
@@ -720,7 +730,7 @@ def main(config: InferenceConfig):
         # The controller holds the last token it received, so from here the robot is executing
         # this one until the policy loop resumes. Record it: it is the previous plan that
         # real-time chunking makes the first post-'i' chunk continuous with.
-        last_sent_motion_token = np.asarray(LATENT_INITIAL_MOTION_TOKEN, dtype=np.float32).copy()
+        last_sent_motion_token = np.asarray(_INITIAL_TOKEN, dtype=np.float32).copy()
         print_green("Sent latent initial pose via ZMQ")
         time.sleep(1.0)
         print("Initial pose done.")
@@ -739,7 +749,7 @@ def main(config: InferenceConfig):
             return False
 
         start_token = last_sent_motion_token.copy()
-        target_token = LATENT_INITIAL_MOTION_TOKEN.copy()
+        target_token = _INITIAL_TOKEN.copy()
         num_steps = max(1, round(config.action_publish_rate * duration_s))
         step_period = 1.0 / config.action_publish_rate
 

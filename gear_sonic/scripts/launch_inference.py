@@ -393,6 +393,7 @@ def main(config: InferenceLaunchConfig):
     hand_space = os.environ.get("SONIC_HAND_SPACE", "inspire")
     # absolute (pi0.5: the bridge subtracts DEFAULT_MJ) | dev (GR00T: nothing does)
     state_q = os.environ.get("SONIC_STATE_Q", "absolute")
+    sonic_version = os.environ.get("SONIC_VERSION", "v1.0")
     ego_video = os.environ.get("SONIC_EGO_VIDEO", "")
     rtc_flag = "" if os.environ.get("SONIC_RTC", "1") != "0" else "--no-rtc "
     if rtc_flag:
@@ -403,6 +404,7 @@ def main(config: InferenceLaunchConfig):
         f"export SONIC_INSPIRE_HANDS={inspire} && "
         f"export SONIC_HAND_SPACE={hand_space} && "
         f"export SONIC_STATE_Q={state_q} && "
+        f"export SONIC_VERSION={sonic_version} && "
         f"export SONIC_EGO_VIDEO='{ego_video}' && "
         f"python gear_sonic/scripts/run_vla_inference.py "
         f"{rtc_flag}"
