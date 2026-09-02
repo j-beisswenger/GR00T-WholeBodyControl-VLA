@@ -271,6 +271,15 @@ def _humanoid_vla_root():
 
 
 _BODY_GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")   # 6+6+3+7+7 = 29
+# SONIC v1.1 (and any future checkpoint whose baked-in modality_configs use non-standard key
+# names) support: read the checkpoint's own experiment_cfg/final_processor_config.json
+# ["processor_kwargs"]["modality_configs"][<embodiment tag>] to find out what it actually wants.
+# v1.1 (3dataset_v11_tracked...) declares state ["left_leg_tracking", ..., "projected_gravity_
+# tracking"] and action ["motion_token_v11"] -- SAME embodiment tag (unitree_g1_sonic) as every
+# v1.0 body-only checkpoint, just renamed columns, so this cannot be handled by a new
+# --embodiment-tag; the server reads modality_configs per-checkpoint, not from a static registry.
+_STATE_SUFFIX = os.environ.get("SONIC_STATE_SUFFIX", "")
+_MOTION_TOKEN_KEY = os.environ.get("SONIC_ACTION_KEY", "motion_token")
 _DEFAULT_MJ = None
 
 
@@ -489,6 +498,16 @@ def prepare_observation_from_sensors(
     if os.environ.get("SONIC_STATE_Q", "absolute") == "dev":
         observation = _to_q_dev(observation)
 
+    # SONIC_STATE_SUFFIX: rename the state groups this checkpoint's baked-in modality_configs
+    # actually asks for (e.g. "left_leg" -> "left_leg_tracking" for SONIC v1.1). Runs LAST --
+    # after q_dev (which looks up groups by their UNSUFFIXED name) and after gravity/hands are
+    # set -- and covers exactly the 6 body+gravity groups a body-only checkpoint declares; a
+    # hand-token checkpoint's hand groups are unaffected (v1.1 has none).
+    if _STATE_SUFFIX:
+        for group in (*_BODY_GROUPS, "projected_gravity"):
+            if group in observation["state"]:
+                observation["state"][group + _STATE_SUFFIX] = observation["state"].pop(group)
+
     return observation
 
 
@@ -509,7 +528,7 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
 
-        motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
+        motion_key = _MOTION_TOKEN_KEY if _MOTION_TOKEN_KEY in action else f"action.{_MOTION_TOKEN_KEY}"
         # The server bounds tokens to the FSQ range before returning, so this check on the
         # RECEIVED chunk can no longer fire on its own. It reports the pre-clip magnitude
         # instead; use it when present, so a diverging chunk is still rejected. This matters
@@ -1023,7 +1042,7 @@ def main(config: InferenceConfig):
                     # Action arrays arrive as (B, T, D) from the model.
                     # Squeeze batch dim to get (T, D), then index by time step.
                     motion_token = np.asarray(
-                        get_action_field(processed_action, "motion_token"),
+                        get_action_field(processed_action, _MOTION_TOKEN_KEY),
                         dtype=np.float32,
                     )
                     if motion_token.ndim == 3:
