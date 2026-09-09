@@ -112,7 +112,21 @@ class InferenceConfig:
 
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
-    """Embodiment tag for policy inference."""
+    """Embodiment tag for policy inference. Use `unitree_g1_sonic_hand` for a checkpoint that
+    predicts hand tokens as well as body tokens -- it declares 7-wide dex3 hand state groups and
+    a 128-d action, and the server validates both, so the tag has to match the checkpoint."""
+
+    # State conventions -- see gear_sonic/utils/inference/vla_utils.py
+    state_q_dev: bool = True
+    """Send body joints as q - DEFAULT_ANGLES_MJ, the convention EVERY SONIC corpus stores and
+    therefore every SONIC checkpoint expects. A GR00T server applies no conversion of its own.
+    Turn this off only for a policy demonstrably trained on absolute q: check the run's
+    experiment_cfg/dataset_statistics.json, where a knee mean near 0 means q_dev and near +0.67
+    means absolute."""
+
+    permute_dex3_hands: bool = True
+    """Reorder the 7-wide hand state groups from the URDF's thumb-first declaration order into
+    HandSONIC's index-first dex3 order, which is what the corpora's hand state holds."""
 
     # Prompt / eval
     prompt: str = "demo"
@@ -260,6 +274,8 @@ def prepare_observation_from_sensors(
     language_prompt: str,
     log_errors: bool = False,
     inspire_reader=None,
+    state_q_dev: bool = True,
+    permute_dex3_hands: bool = True,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -306,7 +322,9 @@ def prepare_observation_from_sensors(
         "timestamps": camera_msg["timestamps"]["ego_view"],
     }
 
-    observation = prepare_observation_for_eval(robot_model, observation)
+    observation = prepare_observation_for_eval(
+        robot_model, observation, q_dev=state_q_dev, permute_dex3_hands=permute_dex3_hands
+    )
 
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
@@ -508,7 +526,7 @@ def main(config: InferenceConfig):
 
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
-        nonlocal last_sent_motion_token
+        nonlocal last_sent_motion_token, last_sent_hand_token
         print("Moving to initial pose")
         left_hand = (
             _compute_closed_hand_joints("L")
@@ -531,6 +549,12 @@ def main(config: InferenceConfig):
         # this one until the policy loop resumes. Record it: it is the previous plan that
         # real-time chunking makes the first post-'i' chunk continuous with.
         last_sent_motion_token = np.asarray(LATENT_INITIAL_MOTION_TOKEN, dtype=np.float32).copy()
+        # No published hand action corresponds to the initial pose, so the prefix goes out
+        # body-only until the first chunk with hands lands. See the note on last_sent_hand_token:
+        # this is the one window where the server still reconstructs (and zero-fills) the hand
+        # columns, and closing it needs an open-hand token from the HandSONIC codec, which does
+        # not live in this repo.
+        last_sent_hand_token = None
         print_green("Sent latent initial pose via ZMQ")
         time.sleep(1.0)
         print("Initial pose done.")
@@ -628,6 +652,10 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
+    # Hand half of the last action published, for the RTC prefix. None for a body-only
+    # checkpoint, and None right after 'i' -- the handover case where the server would otherwise
+    # fall back to a zero hand token, which decodes to a curled hand rather than to "unknown".
+    last_sent_hand_token: np.ndarray | None = None
 
     # Real-time chunking: recent inference delays (seconds). `d` is the p90 over this window --
     # biased high, because under-estimating leaves an already-executed tick unfrozen and the
@@ -641,7 +669,7 @@ def main(config: InferenceConfig):
         nonlocal pause_loop, cpp_loop_running, cpp_mode
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
-        nonlocal zmq_frame_counter, last_sent_motion_token
+        nonlocal zmq_frame_counter, last_sent_motion_token, last_sent_hand_token
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -737,6 +765,8 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
                 inspire_reader=inspire_reader,
+                state_q_dev=config.state_q_dev,
+                permute_dex3_hands=config.permute_dex3_hands,
             ),
             lambda obs, options=None: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -791,6 +821,7 @@ def main(config: InferenceConfig):
                         cached_action_chunk=cached_action_chunk,
                         action_chunk_index=action_chunk_index,
                         last_published_token=last_sent_motion_token,
+                        last_published_hand_token=last_sent_hand_token,
                         # While paused (and right after 'i') the cache holds chunks that were
                         # never executed -- the robot is holding the last token it published.
                         holding=pause_loop,
@@ -910,6 +941,16 @@ def main(config: InferenceConfig):
                     )
                     zmq_socket.send(zmq_message)
                     last_sent_motion_token = motion_token.copy()
+                    # Same row index as the body token, so the two halves of the RTC prefix
+                    # describe one action rather than two different ticks.
+                    hand_token_chunk = get_action_field(
+                        processed_action, "hand_token", required=False
+                    )
+                    hand_token_now = select_action_step(hand_token_chunk, current_idx)
+                    last_sent_hand_token = (
+                        None if hand_token_now is None
+                        else np.asarray(hand_token_now, dtype=np.float32).copy()
+                    )
                     if zmq_frame_counter % 50 == 0:
                         print_green(
                             f"ZMQ: Sent latent action - "
