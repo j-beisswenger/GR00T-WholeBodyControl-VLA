@@ -25,6 +25,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 
 import collections
 import os
+import pathlib
 from dataclasses import dataclass
 import queue
 import threading
@@ -267,6 +268,65 @@ def select_action_step(array, index: int):
 # ---------------------------------------------------------------------------
 
 
+def _humanoid_vla_root() -> pathlib.Path:
+    """Search upward from this file for the parent humanoid-vla repo root.
+
+    Search-based (not a hardcoded parents[N] depth) so it stays correct regardless of how
+    deep this file lives relative to the repo root.
+    """
+    here = pathlib.Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "deploy" / "real" / "common" / "sonic_constants.py").exists():
+            return parent
+    raise RuntimeError(f"Could not locate humanoid-vla repo root from {here}")
+
+
+_HAND_CODEC = None
+_HAND_FILTER_STATE = None      # raw decoded rows from the last hand_token decode; threads the
+                                # codec's k=5 moving average across chunks (see token_to_inspire)
+
+
+def _decode_hand_token_chunk(hand_token):
+    """GR00T handtoken action (T, 64) or (B, T, 64) raw FSQ codes -> (T, 12) Inspire targets.
+
+    WHY THIS EXISTS: a GR00T handtoken checkpoint's action dict is {motion_token, hand_token} --
+    hand_token is a raw HandSONIC latent, not a joint target. The pi0.5 bridge decodes this
+    itself and returns action.left_hand_joints/right_hand_joints directly; nothing in this
+    (GR00T) serving path does that decode on its own. Without it, get_action_field(
+    processed_action, "left_hand_joints") is ALWAYS None for a handtoken checkpoint, so the
+    write-gate around inspire_reader.write() never fires and the hands are simply never
+    commanded -- they read correctly (proprio) but sit exactly where open_hands() parked them
+    at startup and never move.
+
+    Threads the codec's moving-average filter state across chunks via prev_rows/return_rows
+    (its own docstring: without this, row 0 of every chunk reaches the servos unsmoothed --
+    2.8 deg step vs 0.9 deg threaded, at the ~2.5 Hz replan rate). Reset alongside the other
+    per-trial state on 'i' -- see reset_hand_filter_state().
+    """
+    global _HAND_CODEC, _HAND_FILTER_STATE
+    if _HAND_CODEC is None:
+        import sys
+
+        repo = _humanoid_vla_root()
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from deploy.real.common.hand_codec import HandCodec
+
+        _HAND_CODEC = HandCodec()
+    tok = np.asarray(hand_token, np.float32)
+    if tok.ndim == 3:
+        tok = tok[0]
+    out, rows = _HAND_CODEC.token_to_inspire(tok, prev_rows=_HAND_FILTER_STATE, return_rows=True)
+    _HAND_FILTER_STATE = rows
+    return out
+
+
+def reset_hand_filter_state():
+    """Drop the hand_token decode filter's cross-chunk memory. No-op if never armed."""
+    global _HAND_FILTER_STATE
+    _HAND_FILTER_STATE = None
+
+
 def prepare_observation_from_sensors(
     camera_subscriber,
     state_subscriber,
@@ -384,6 +444,18 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
             return None
 
         processed_action = concat_action(robot_model, action)
+
+        # Decode the raw hand_token latent into Inspire targets, if this is a GR00T handtoken
+        # checkpoint (hand_token present) and SONIC_INSPIRE_HANDS=1 (hands enabled). Skipped
+        # when left_hand_joints already exists in the action dict -- that means a pi0.5-style
+        # server already decoded hands itself, and this would be a no-op then anyway.
+        if ("hand_token" in processed_action
+                and "left_hand_joints" not in processed_action
+                and os.environ.get("SONIC_INSPIRE_HANDS", "0") == "1"):
+            inspire12 = _decode_hand_token_chunk(processed_action["hand_token"])
+            processed_action["left_hand_joints"] = inspire12[:, :6]
+            processed_action["right_hand_joints"] = inspire12[:, 6:]
+
         return processed_action
     except Exception as e:
         print(f"Error in inference: {e}")
@@ -709,6 +781,7 @@ def main(config: InferenceConfig):
             zmq_frame_counter = 0
             cached_action_chunk = None
             action_chunk_index = 0
+            reset_hand_filter_state()
             print("Cleared cached action chunk, reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
