@@ -132,6 +132,14 @@ class InferenceLaunchConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy."""
 
+    rtc: bool = True
+    """Send real-time-chunking options (prev_chunk_tail/delay_ticks) to the policy server.
+    Turn off for a checkpoint with rtc_max_delay=0 (not trained with training-time RTC) --
+    a server given RTC options still pins them even at rtc_max_delay=0, off-distribution,
+    rather than skip pinning on its own (see gr00t_policy._rtc_options_from_robot's own
+    warning). This dataclass previously had no way to forward --no-rtc to
+    run_vla_inference.py at all; --rtc/--no-rtc here now does."""
+
     initial_pose_blend_duration: float = 2.0
     """Duration (seconds) for smooth interpolation to the initial pose when
     pressing 'i'. Higher = slower/smoother. Set to 0 to snap instantly."""
@@ -272,6 +280,7 @@ def main(config: InferenceLaunchConfig):
     print(f"  Prompt:          {config.prompt}")
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
+    print(f"  RTC:             {'on' if config.rtc else 'off'}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
@@ -397,7 +406,8 @@ def main(config: InferenceLaunchConfig):
         f"--action-horizon {config.action_horizon} "
         f"--initial-pose-blend-duration {config.initial_pose_blend_duration} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"{'--rtc' if config.rtc else '--no-rtc'}"
     )
 
     print("Starting VLA inference (pane 1)...")
