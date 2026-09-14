@@ -393,10 +393,12 @@ def main(config: InferenceLaunchConfig):
     # it silently did not, the Inspire reader was never constructed, and the policy got the
     # all-zero dex3 slots as hand proprio with no error anywhere.
     inspire = os.environ.get("SONIC_INSPIRE_HANDS", "0")
+    hand_space = os.environ.get("SONIC_HAND_SPACE", "inspire")
     inference_cmd = (
         f"cd {repo_root} && "
         f"source .venv_inference/bin/activate && "
         f"export SONIC_INSPIRE_HANDS={inspire} && "
+        f"export SONIC_HAND_SPACE={hand_space} && "
         f"python gear_sonic/scripts/run_vla_inference.py "
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "

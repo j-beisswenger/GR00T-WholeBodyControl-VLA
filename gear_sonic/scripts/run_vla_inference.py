@@ -405,8 +405,20 @@ def prepare_observation_from_sensors(
         hands = inspire_reader.read()
         if hands is not None:
             left6, right6 = hands
-            observation["state"]["left_hand"] = left6[np.newaxis, np.newaxis]
-            observation["state"]["right_hand"] = right6[np.newaxis, np.newaxis]
+            if os.environ.get("SONIC_HAND_SPACE", "inspire") == "dex3":
+                # The unitree_g1_sonic_hand checkpoints want 7 dex3 joints per hand and their
+                # server does no retargeting of its own (unlike pi0.5's bridge, which dispatches
+                # on width). Without this, the raw 6-DOF Inspire vector lands in a state slot the
+                # checkpoint's normalization stats expect to be 7-wide -- IndexError: boolean
+                # index did not match indexed array along dimension 1; dimension is 6 but
+                # corresponding boolean dimension is 7.
+                from gear_sonic.utils.inference.inspire_hands import to_dex3
+
+                left, right = to_dex3(left6, right6)
+            else:
+                left, right = left6, right6
+            observation["state"]["left_hand"] = left[np.newaxis, np.newaxis]
+            observation["state"]["right_hand"] = right[np.newaxis, np.newaxis]
 
     return observation
 

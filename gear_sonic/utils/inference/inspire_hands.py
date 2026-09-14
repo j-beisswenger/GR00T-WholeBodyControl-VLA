@@ -34,6 +34,7 @@ CONVENTIONS (all verified against the sources named, except where flagged)
 from __future__ import annotations
 
 import os
+import pathlib
 import time
 
 import numpy as np
@@ -82,6 +83,56 @@ def _ctrl_to_rad(regs) -> np.ndarray:
     if THUMB_BEND_IS_DISTAL:
         q[1] = q[1] / THUMB_BEND_SCALE
     return q.astype(np.float32)
+
+
+def _humanoid_vla_root():
+    """Walk up to the humanoid-vla checkout that holds the shared deploy constants.
+
+    Searched rather than counted: this file and run_vla_inference.py sit at different depths,
+    and a hardcoded parents[N] silently resolves to the wrong directory from one of them.
+    """
+    here = pathlib.Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "deploy" / "real" / "common" / "sonic_constants.py").exists():
+            return cand
+    raise RuntimeError(
+        f"cannot find the humanoid-vla root above {here}; SONIC_HAND_SPACE=dex3 needs "
+        "deploy/real/common from the parent repo")
+
+
+_CODEC = None
+
+
+def to_dex3(left6, right6):
+    """Inspire (6+6, joint convention) -> the 14-d dex3 vector, split 7 + 7.
+
+    The GR00T handtoken checkpoints declare `left_hand`/`right_hand` as **7 dex3 joints**, and
+    their server consumes the state groups directly -- there is no bridge to retarget for us,
+    unlike pi0.5's `--hand-proprio inspire`. So do the retarget here: encode the live Inspire
+    pose, decode it in dex3 space. Identical call to the one the pi0.5 bridge makes, and
+    identical to how training built the block (`_dex3_current`: decode the hand token with the
+    dex3 decoder, frame 0).
+
+    Without this, the raw 6-DOF Inspire vector gets sent straight into a state slot the
+    checkpoint's normalization stats expect to be 7-wide -- IndexError: boolean index did not
+    match indexed array along dimension 1; dimension is 6 but corresponding boolean dimension
+    is 7 (normalize_values_minmax's mask is sized off the 7-wide dex3 stats).
+
+    ORDER: the returned vector is the codec's INDEX-FIRST dex3 order, which is what the HE
+    corpora store. It is NOT permuted to the robot's thumb-first URDF order -- these values
+    never came from the robot's joints, they were generated in codec space.
+    """
+    global _CODEC
+    if _CODEC is None:
+        import sys
+        repo = _humanoid_vla_root()
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from deploy.real.common.hand_codec import HandCodec
+        _CODEC = HandCodec()
+    d = _CODEC.inspire_to_dex3(np.concatenate([np.asarray(left6, np.float32),
+                                               np.asarray(right6, np.float32)]))
+    return d[:7].astype(np.float32), d[7:].astype(np.float32)
 
 
 class InspireHandReader:
