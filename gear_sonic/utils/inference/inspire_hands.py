@@ -140,6 +140,17 @@ class InspireHandReader:
 
     `read()` returns `(left6, right6)` in radians, or `None` if either hand is unavailable --
     the caller then leaves the observation untouched rather than feeding the policy a guess.
+
+    `read()` is rate-limited the same way `write()` already was: `SONIC_INSPIRE_READ_HZ`
+    (default 20) sets a ceiling on actual Modbus round-trips, and a call in between returns the
+    last successfully-polled reading. Before this, `read()` had NO throttle at all and was
+    called unconditionally once per observation-prep tick -- i.e. up to `action_publish_rate`
+    (default 50 Hz) -- issuing two sequential BLOCKING Modbus transactions per call (left hand,
+    then right hand: up to 100 round-trips/sec sustained to an embedded servo controller). Read
+    and write failures share one `_fails` counter, and `_give_up` disables the hands for the
+    rest of the run after just 3 consecutive failures (read OR write) -- so an unthrottled read
+    path alone was enough to trip that and produce "hands stop responding" with the write path
+    never at fault.
     """
 
     def __init__(self, left_host: str = LEFT_HOST, right_host: str = RIGHT_HOST, port: int = PORT):
@@ -147,8 +158,11 @@ class InspireHandReader:
         self._port = port
         self._clients = None
         self._warned = False
-        self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "25"))
+        self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "20"))
         self._last_write = 0.0
+        self._read_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_READ_HZ", "20"))
+        self._last_read = 0.0
+        self._cached_hands = None    # last successful (left6, right6); served on throttled polls
         self._unit_kw = None      # "slave" (pymodbus 3.x) or "device_id" (4.x); detected once
         self._fails = 0
         self._disabled = False
@@ -206,6 +220,17 @@ class InspireHandReader:
                   "for this run", flush=True)
 
     def read(self):
+        """Poll both hands, rate-limited to `SONIC_INSPIRE_READ_HZ` (default 20).
+
+        A call in between polls returns the cached reading from the last successful poll
+        (`self._cached_hands`), not a fresh Modbus round-trip -- so the caller can call this
+        every tick at any loop rate and the actual device traffic still stays bounded. Only a
+        REAL failure (connect/transport/error-response) returns None, same as before; a
+        throttled call is not a failure and does not touch `_fails`.
+        """
+        now = time.monotonic()
+        if self._cached_hands is not None and now - self._last_read < self._read_period:
+            return self._cached_hands
         if not self._connect():
             return None
         out = []
@@ -223,14 +248,16 @@ class InspireHandReader:
                 return None
             out.append(_ctrl_to_rad(rr.registers))
         self._fails = 0
-        return out[0], out[1]
+        self._last_read = now
+        self._cached_hands = (out[0], out[1])
+        return self._cached_hands
 
     def write(self, left6, right6) -> bool:
         """Command both hands. Returns False if the write did not reach the hardware.
 
         Rate-limited: the control loop publishes at 50 Hz, far faster than these servos need or
         than Modbus TCP round-trips comfortably sustain, and a backed-up socket would stall the
-        loop it is called from. `SONIC_INSPIRE_WRITE_HZ` (default 25) sets the ceiling; ticks
+        loop it is called from. `SONIC_INSPIRE_WRITE_HZ` (default 20) sets the ceiling; ticks
         in between are dropped, not queued, so the hands always track the LATEST target.
         """
         if not self._connect():
