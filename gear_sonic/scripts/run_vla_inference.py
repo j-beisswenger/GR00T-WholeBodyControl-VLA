@@ -656,6 +656,21 @@ def main(config: InferenceConfig):
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
+    def _open_inspire_hands_for_initial_pose():
+        """'i' parks Inspire hands OPEN. The hand fields of the latent ZMQ message only reach the
+        C++ loop's Dex3 path; a G1 wearing Inspire hands is driven over Modbus by inspire_reader
+        (SONIC_INSPIRE_HANDS=1) and would otherwise keep whatever the last policy chunk
+        commanded. Open = the rest pose the policy's state assumes at episode start (the same
+        call made at startup). The '['/']' closed-hand toggles are Dex3-only."""
+        if inspire_reader is None:
+            return
+        if initial_pose_left_hand_closed or initial_pose_right_hand_closed:
+            print("[inspire] closed-hand toggle is Dex3-only; Inspire hands open on 'i'")
+        if inspire_reader.open_hands():
+            print("[inspire] hands OPEN (initial pose)")
+        else:
+            print("[inspire] WARNING: could not open hands (Modbus write failed)")
+
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
         nonlocal last_sent_motion_token, last_sent_hand_token
@@ -677,6 +692,7 @@ def main(config: InferenceConfig):
             right_hand_joints=right_hand,
         )
         zmq_socket.send(zmq_message)
+        _open_inspire_hands_for_initial_pose()
         # The controller holds the last token it received, so from here the robot is executing
         # this one until the policy loop resumes. Record it: it is the previous plan that
         # real-time chunking makes the first post-'i' chunk continuous with.
@@ -745,6 +761,7 @@ def main(config: InferenceConfig):
             if remaining > 0:
                 time.sleep(remaining)
 
+        _open_inspire_hands_for_initial_pose()
         print_green("Initial pose blend complete.")
         return True
 
