@@ -13,6 +13,41 @@ pose in the new checkpoint's latent space.
 
 import numpy as np
 
+# 64-dim SONIC v1.1 idle token DERIVED FROM THE HUMANOID EVERYDAY START POSE (2026-09-17).
+# The tracked HE corpus (sonic_tracked/humanoid_everyday, 4064 episodes) starts every episode in
+# one consistent stance (per-joint std 0.02-0.10 rad, no clusters): straighter legs than
+# DEFAULT_MJ (knees 0.41 rad vs 0.67, pelvis ~2 cm higher) and arms hanging with more bent
+# elbows (0.89/0.92 rad vs 0.60). Idling in the corpus's own start pose puts the policy's first
+# observation where its training episodes begin. Target joints (MuJoCo order, rad) are in the
+# parent repo at deploy/sim/pi05/assets/he_start_pose/he_start_pose_abs_q29_mj.npy (the median
+# of frame 0 over all episodes); render vs DEFAULT_MJ next to it.
+#
+# DERIVED with deploy/sim/pi05/derive_idle_token.py: the target stance repeated over the 10
+# future frames, zero joint velocity, identity base orientation, G1 mode, through the v1.1
+# encoder ONNX using the validated v1.1 layout (deploy/sim/sonic_roundtrip.py LAYOUT_V11) -- the
+# same recipe as the two tokens below. VERIFIED by holding this exact token under the v1.1
+# decoder in MuJoCo (SonicSim, 200 Hz PD) for 20 s from DEFAULT_MJ: stable, final-second joint
+# jitter 0.01 deg, pelvis z 0.779 m (vs 0.760 m for the low-heat token: the legs are straighter),
+# settled joints within 1.0 deg mean / 4.8 deg max (left elbow) of the target. The low-heat token
+# below settles 4.0 deg mean / 17.8 deg max from it (elbows, knees). Byte-identical to
+# deploy/sim/pi05/assets/initial_pose_token_v11_he.npy, which the sim's idle uses.
+LATENT_INITIAL_MOTION_TOKEN = np.array(
+    [
+         0.1250, -0.2500,  0.0000,  0.0000,  0.0625,  0.0000,  0.1250,
+         0.0000, -0.0625,  0.1250,  0.0000, -0.1250,  0.3750,  0.1250,
+        -0.0625,  0.0000,  0.0625,  0.0000,  0.0625, -0.1250, -0.0625,
+        -0.0625,  0.0000,  0.1250, -0.3125,  0.3125, -0.0625,  0.0625,
+         0.1875, -0.3125,  0.1875,  0.0000, -0.0625,  0.0625,  0.2500,
+         0.0625, -0.0625,  0.2500,  0.1875,  0.0000,  0.0000,  0.0625,
+         0.0625, -0.0625,  0.2500,  0.3750,  0.3750, -0.0625,  0.0000,
+        -0.2500,  0.0000, -0.0625, -0.3125, -0.1875,  0.0625, -0.0625,
+         0.3750,  0.1250,  0.0000,  0.1875, -0.0625,  0.0000,  0.1250,
+         0.0000,
+    ],
+    dtype=np.float32,
+)
+
+# Previous 'i' token (2026-09-16 -> 2026-09-17): the low-heat variant, kept for reference.
 # 64-dim motion token for a stable standing pose, SONIC v1.1's latent space (encoder 1751-D,
 # decoder 994-D). This branch's checkpoints are all trained on the v1.1 closed-loop
 # sonic_tracked corpora (egostandard/humanoid_everyday/leverb/psi/unifolm), which is NOT
@@ -38,7 +73,7 @@ import numpy as np
 # DEFAULT_MJ-derived v1.1 idle held 0.753-0.768 m over 5s -- same healthy band), final elbow
 # angles L1.139/R1.231 rad (vs DEFAULT_MJ's 0.6 rad and the old idle token's own settled
 # ~0.556/0.615 rad).
-LATENT_INITIAL_MOTION_TOKEN = np.array(
+LATENT_INITIAL_MOTION_TOKEN_V1_1_LOWHEAT = np.array(
     [
         0.0625, -0.3750,  0.0000, -0.0625,  0.0625,  0.0000,  0.1250,
         0.0000, -0.1875,  0.2500,  0.0000, -0.0625,  0.4375,  0.0625,
