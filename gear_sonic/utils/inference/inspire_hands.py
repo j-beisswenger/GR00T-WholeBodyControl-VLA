@@ -88,16 +88,16 @@ def _ctrl_to_rad(regs) -> np.ndarray:
 def _humanoid_vla_root():
     """Walk up to the humanoid-vla checkout that holds the shared deploy constants.
 
-    Searched rather than counted: this file and inspire_hands.py sit at different depths, and
-    a hardcoded parents[N] silently resolves to the wrong directory from one of them.
+    Searched rather than counted: this file and run_vla_inference.py sit at different depths,
+    and a hardcoded parents[N] silently resolves to the wrong directory from one of them.
     """
     here = pathlib.Path(__file__).resolve()
     for cand in here.parents:
         if (cand / "deploy" / "real" / "common" / "sonic_constants.py").exists():
             return cand
     raise RuntimeError(
-        f"cannot find the humanoid-vla root above {here}; SONIC_STATE_Q=dev and "
-        "SONIC_HAND_SPACE=dex3 both need deploy/real/common from the parent repo")
+        f"cannot find the humanoid-vla root above {here}; SONIC_HAND_SPACE=dex3 needs "
+        "deploy/real/common from the parent repo")
 
 
 _CODEC = None
@@ -112,6 +112,11 @@ def to_dex3(left6, right6):
     same retarget here: encode the live Inspire pose, decode it in dex3 space. Identical call to
     the one the pi0.5 bridge makes, and identical to how training built the block
     (`_dex3_current`: decode the hand token with the dex3 decoder, frame 0).
+
+    Without this, the raw 6-DOF Inspire vector gets sent straight into a state slot the
+    checkpoint's normalization stats expect to be 7-wide -- IndexError: boolean index did not
+    match indexed array along dimension 1; dimension is 6 but corresponding boolean dimension
+    is 7 (normalize_values_minmax's mask is sized off the 7-wide dex3 stats).
 
     ORDER: the returned vector is the codec's INDEX-FIRST dex3 order, which is what the HE
     corpora store (`data/README_HAND.md`: "Humanoid-Everyday observation.state[:, 29:43] is
@@ -136,6 +141,17 @@ class InspireHandReader:
 
     `read()` returns `(left6, right6)` in radians, or `None` if either hand is unavailable --
     the caller then leaves the observation untouched rather than feeding the policy a guess.
+
+    `read()` is rate-limited the same way `write()` already was: `SONIC_INSPIRE_READ_HZ`
+    (default 20) sets a ceiling on actual Modbus round-trips, and a call in between returns the
+    last successfully-polled reading. Before this, `read()` had NO throttle at all and was
+    called unconditionally once per observation-prep tick -- i.e. up to `action_publish_rate`
+    (default 50 Hz) -- issuing two sequential BLOCKING Modbus transactions per call (left hand,
+    then right hand: up to 100 round-trips/sec sustained to an embedded servo controller). Read
+    and write failures share one `_fails` counter, and `_give_up` disables the hands for the
+    rest of the run after just 3 consecutive failures (read OR write) -- so an unthrottled read
+    path alone was enough to trip that and produce "hands stop responding" with the write path
+    never at fault.
     """
 
     def __init__(self, left_host: str = LEFT_HOST, right_host: str = RIGHT_HOST, port: int = PORT):
@@ -143,8 +159,11 @@ class InspireHandReader:
         self._port = port
         self._clients = None
         self._warned = False
-        self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "25"))
+        self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "20"))
         self._last_write = 0.0
+        self._read_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_READ_HZ", "20"))
+        self._last_read = 0.0
+        self._cached_hands = None    # last successful (left6, right6); served on throttled polls
         self._unit_kw = None      # "slave" (pymodbus 3.x) or "device_id" (4.x); detected once
         self._fails = 0
         self._disabled = False
@@ -202,6 +221,17 @@ class InspireHandReader:
                   "for this run", flush=True)
 
     def read(self):
+        """Poll both hands, rate-limited to `SONIC_INSPIRE_READ_HZ` (default 20).
+
+        A call in between polls returns the cached reading from the last successful poll
+        (`self._cached_hands`), not a fresh Modbus round-trip -- so the caller can call this
+        every tick at any loop rate and the actual device traffic still stays bounded. Only a
+        REAL failure (connect/transport/error-response) returns None, same as before; a
+        throttled call is not a failure and does not touch `_fails`.
+        """
+        now = time.monotonic()
+        if self._cached_hands is not None and now - self._last_read < self._read_period:
+            return self._cached_hands
         if not self._connect():
             return None
         out = []
@@ -219,14 +249,16 @@ class InspireHandReader:
                 return None
             out.append(_ctrl_to_rad(rr.registers))
         self._fails = 0
-        return out[0], out[1]
+        self._last_read = now
+        self._cached_hands = (out[0], out[1])
+        return self._cached_hands
 
     def write(self, left6, right6) -> bool:
         """Command both hands. Returns False if the write did not reach the hardware.
 
         Rate-limited: the control loop publishes at 50 Hz, far faster than these servos need or
         than Modbus TCP round-trips comfortably sustain, and a backed-up socket would stall the
-        loop it is called from. `SONIC_INSPIRE_WRITE_HZ` (default 25) sets the ceiling; ticks
+        loop it is called from. `SONIC_INSPIRE_WRITE_HZ` (default 20) sets the ceiling; ticks
         in between are dropped, not queued, so the hands always track the LATEST target.
         """
         if not self._connect():

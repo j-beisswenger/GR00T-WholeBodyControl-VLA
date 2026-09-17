@@ -44,10 +44,7 @@ from gear_sonic.utils.data_collection.keyboard_subscriber import (
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
-from gear_sonic.utils.inference.initial_poses import (  # noqa: E402
-    LATENT_INITIAL_MOTION_TOKEN,
-    LATENT_INITIAL_MOTION_TOKEN_V1_1,
-)
+from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
 from gear_sonic.utils.inference.vla_utils import (
     build_prev_chunk_tail,
     calculate_latency_compensated_index,
@@ -116,7 +113,21 @@ class InferenceConfig:
 
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
-    """Embodiment tag for policy inference."""
+    """Embodiment tag for policy inference. Use `unitree_g1_sonic_hand` for a checkpoint that
+    predicts hand tokens as well as body tokens -- it declares 7-wide dex3 hand state groups and
+    a 128-d action, and the server validates both, so the tag has to match the checkpoint."""
+
+    # State conventions -- see gear_sonic/utils/inference/vla_utils.py
+    state_q_dev: bool = True
+    """Send body joints as q - DEFAULT_ANGLES_MJ, the convention EVERY SONIC corpus stores and
+    therefore every SONIC checkpoint expects. A GR00T server applies no conversion of its own.
+    Turn this off only for a policy demonstrably trained on absolute q: check the run's
+    experiment_cfg/dataset_statistics.json, where a knee mean near 0 means q_dev and near +0.67
+    means absolute."""
+
+    permute_dex3_hands: bool = True
+    """Reorder the 7-wide hand state groups from the URDF's thumb-first declaration order into
+    HandSONIC's index-first dex3 order, which is what the corpora's hand state holds."""
 
     # Prompt / eval
     prompt: str = "demo"
@@ -257,78 +268,22 @@ def select_action_step(array, index: int):
 # ---------------------------------------------------------------------------
 
 
+def _humanoid_vla_root() -> pathlib.Path:
+    """Search upward from this file for the parent humanoid-vla repo root.
 
-def _humanoid_vla_root():
-    """Walk up to the humanoid-vla checkout that holds the shared deploy constants.
-
-    Searched rather than counted: this file and inspire_hands.py sit at different depths, and
-    a hardcoded parents[N] silently resolves to the wrong directory from one of them.
+    Search-based (not a hardcoded parents[N] depth) so it stays correct regardless of how
+    deep this file lives relative to the repo root.
     """
     here = pathlib.Path(__file__).resolve()
-    for cand in here.parents:
-        if (cand / "deploy" / "real" / "common" / "sonic_constants.py").exists():
-            return cand
-    raise RuntimeError(
-        f"cannot find the humanoid-vla root above {here}; SONIC_STATE_Q=dev and "
-        "SONIC_HAND_SPACE=dex3 both need deploy/real/common from the parent repo")
+    for parent in here.parents:
+        if (parent / "deploy" / "real" / "common" / "sonic_constants.py").exists():
+            return parent
+    raise RuntimeError(f"Could not locate humanoid-vla repo root from {here}")
 
 
-_BODY_GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")   # 6+6+3+7+7 = 29
-# SONIC v1.1 (and any future checkpoint whose baked-in modality_configs use non-standard key
-# names) support: read the checkpoint's own experiment_cfg/final_processor_config.json
-# ["processor_kwargs"]["modality_configs"][<embodiment tag>] to find out what it actually wants.
-# v1.1 (3dataset_v11_tracked...) declares state ["left_leg_tracking", ..., "projected_gravity_
-# tracking"] and action ["motion_token_v11"] -- SAME embodiment tag (unitree_g1_sonic) as every
-# v1.0 body-only checkpoint, just renamed columns, so this cannot be handled by a new
-# --embodiment-tag; the server reads modality_configs per-checkpoint, not from a static registry.
-_STATE_SUFFIX = os.environ.get("SONIC_STATE_SUFFIX", "")
-# SONIC_VERSION selects the 'i'-key idle token: it is a point in ONE SONIC checkpoint's latent
-# space (initial_poses.py's own warning) and means nothing to a different decoder. Must match
-# whichever decoder deploy.sh is actually running (--cp/--obs-config), not the VLA checkpoint's
-# training data version -- those decode.sh flags are what decides the C++ decoder in force.
-_INITIAL_TOKEN = (LATENT_INITIAL_MOTION_TOKEN_V1_1
-                  if os.environ.get("SONIC_VERSION", "v1.0") == "v1.1"
-                  else LATENT_INITIAL_MOTION_TOKEN)
-_MOTION_TOKEN_KEY = os.environ.get("SONIC_ACTION_KEY", "motion_token")
-_DEFAULT_MJ = None
-
-
-def _to_q_dev(observation):
-    """Subtract the SONIC stance from the body groups, in place.
-
-    WHY: the GR00T checkpoints are trained on q_dev. `roboxperience_converter/convert.py`
-    writes `observation.state = remap(q_dev)[29] + gravity_body[3]`, with
-    `q_dev = q_il - DEFAULT_ANGLES_IL`, and their dataset statistics agree (knee mean -0.046,
-    not the +0.669 an absolute stance reads). Nothing in the GR00T serving path subtracts it --
-    unlike pi0.5, whose bridge does it in `build_state32` -- so the robot has to.
-
-    Groups only, never gravity or the hands. Each group already arrives in SONIC intra-group
-    order, so concatenating the five is exactly the DEFAULT_MJ layout: no permutation.
-
-    NB the SONIC DECODER's own 994-d observation is a different vector and is already
-    stance-subtracted by the C++ deploy; this does not touch it.
-    """
-    global _DEFAULT_MJ
-    if _DEFAULT_MJ is None:
-        import sys
-        repo = _humanoid_vla_root()
-        if str(repo) not in sys.path:
-            sys.path.insert(0, str(repo))
-        from deploy.real.common.sonic_constants import DEFAULT_MJ
-        _DEFAULT_MJ = DEFAULT_MJ
-    off = 0
-    for g in _BODY_GROUPS:
-        v = observation["state"].get(g)
-        if v is None:
-            raise KeyError(f"SONIC_STATE_Q=dev needs observation['state']['{g}']")
-        n = np.asarray(v).shape[-1]
-        observation["state"][g] = np.asarray(v, np.float32) - _DEFAULT_MJ[off:off + n]
-        off += n
-    if off != 29:
-        raise ValueError(f"body groups summed to {off} dof, expected 29")
-    return observation
-
-
+# SONIC_EGO_VIDEO diagnostic override, ported from main (fcb58f3): kept as its own env var
+# rather than a tyro CLI field -- self-contained diagnostic knob, not part of the checkpoint-
+# facing config surface (InferenceConfig).
 _EGO_VIDEO_FRAMES = None       # cached list of (H, W, 3) uint8 frames, or None until loaded
 _EGO_VIDEO_START = None        # time.monotonic() reference; None until armed
 _EGO_VIDEO_DT = 1.0 / 50.0     # frames are 1:1 with 50 Hz ticks in the converted corpora
@@ -381,11 +336,12 @@ def _decode_hand_token_chunk(hand_token):
 
     WHY THIS EXISTS: a GR00T handtoken checkpoint's action dict is {motion_token, hand_token} --
     hand_token is a raw HandSONIC latent, not a joint target. The pi0.5 bridge decodes this
-    itself and returns action.left_hand_joints/right_hand_joints directly; nothing in the GR00T
-    serving path does that decode. Without it, get_action_field(processed_action,
-    "left_hand_joints") is ALWAYS None for a handtoken checkpoint, so the write-gate below never
-    fires and the hands are simply never commanded -- confirmed live: they read correctly
-    (proprio) but sit exactly where open_hands() parked them at startup and never move.
+    itself and returns action.left_hand_joints/right_hand_joints directly; nothing in this
+    (GR00T) serving path does that decode on its own. Without it, get_action_field(
+    processed_action, "left_hand_joints") is ALWAYS None for a handtoken checkpoint, so the
+    write-gate around inspire_reader.write() never fires and the hands are simply never
+    commanded -- they read correctly (proprio) but sit exactly where open_hands() parked them
+    at startup and never move.
 
     Threads the codec's moving-average filter state across chunks via prev_rows/return_rows
     (its own docstring: without this, row 0 of every chunk reaches the servos unsmoothed --
@@ -423,6 +379,8 @@ def prepare_observation_from_sensors(
     language_prompt: str,
     log_errors: bool = False,
     inspire_reader=None,
+    state_q_dev: bool = True,
+    permute_dex3_hands: bool = True,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -472,7 +430,9 @@ def prepare_observation_from_sensors(
         "timestamps": camera_msg["timestamps"]["ego_view"],
     }
 
-    observation = prepare_observation_for_eval(robot_model, observation)
+    observation = prepare_observation_for_eval(
+        robot_model, observation, q_dev=state_q_dev, permute_dex3_hands=permute_dex3_hands
+    )
 
     # Projected gravity for Sonic latent embodiment
     assert "base_quat" in state_msg, "base_quat not found in state_msg"
@@ -494,9 +454,12 @@ def prepare_observation_from_sensors(
         if hands is not None:
             left6, right6 = hands
             if os.environ.get("SONIC_HAND_SPACE", "inspire") == "dex3":
-                # GR00T handtoken checkpoints want 7 dex3 joints per hand and their server does
-                # no retargeting; pi0.5's bridge does it itself from the 6-DOF vector. Same
-                # codec either way -- only the side that calls it differs.
+                # The unitree_g1_sonic_hand checkpoints want 7 dex3 joints per hand and their
+                # server does no retargeting of its own (unlike pi0.5's bridge, which dispatches
+                # on width). Without this, the raw 6-DOF Inspire vector lands in a state slot the
+                # checkpoint's normalization stats expect to be 7-wide -- IndexError: boolean
+                # index did not match indexed array along dimension 1; dimension is 6 but
+                # corresponding boolean dimension is 7.
                 from gear_sonic.utils.inference.inspire_hands import to_dex3
 
                 left, right = to_dex3(left6, right6)
@@ -504,19 +467,6 @@ def prepare_observation_from_sensors(
                 left, right = left6, right6
             observation["state"]["left_hand"] = left[np.newaxis, np.newaxis]
             observation["state"]["right_hand"] = right[np.newaxis, np.newaxis]
-
-    if os.environ.get("SONIC_STATE_Q", "absolute") == "dev":
-        observation = _to_q_dev(observation)
-
-    # SONIC_STATE_SUFFIX: rename the state groups this checkpoint's baked-in modality_configs
-    # actually asks for (e.g. "left_leg" -> "left_leg_tracking" for SONIC v1.1). Runs LAST --
-    # after q_dev (which looks up groups by their UNSUFFIXED name) and after gravity/hands are
-    # set -- and covers exactly the 6 body+gravity groups a body-only checkpoint declares; a
-    # hand-token checkpoint's hand groups are unaffected (v1.1 has none).
-    if _STATE_SUFFIX:
-        for group in (*_BODY_GROUPS, "projected_gravity"):
-            if group in observation["state"]:
-                observation["state"][group + _STATE_SUFFIX] = observation["state"].pop(group)
 
     return observation
 
@@ -538,7 +488,7 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
 
-        motion_key = _MOTION_TOKEN_KEY if _MOTION_TOKEN_KEY in action else f"action.{_MOTION_TOKEN_KEY}"
+        motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
         # The server bounds tokens to the FSQ range before returning, so this check on the
         # RECEIVED chunk can no longer fire on its own. It reports the pre-clip magnitude
         # instead; use it when present, so a diverging chunk is still rejected. This matters
@@ -708,7 +658,7 @@ def main(config: InferenceConfig):
 
     def publish_initial_pose():
         """Publish initial pose command to move robot to starting position."""
-        nonlocal last_sent_motion_token
+        nonlocal last_sent_motion_token, last_sent_hand_token
         print("Moving to initial pose")
         left_hand = (
             _compute_closed_hand_joints("L")
@@ -721,7 +671,7 @@ def main(config: InferenceConfig):
             else np.zeros(7, dtype=np.float32)
         )
         zmq_message = pack_latent_action_message(
-            motion_token=_INITIAL_TOKEN,
+            motion_token=LATENT_INITIAL_MOTION_TOKEN,
             frame_index=np.array([0], dtype=np.int64),
             left_hand_joints=left_hand,
             right_hand_joints=right_hand,
@@ -730,7 +680,13 @@ def main(config: InferenceConfig):
         # The controller holds the last token it received, so from here the robot is executing
         # this one until the policy loop resumes. Record it: it is the previous plan that
         # real-time chunking makes the first post-'i' chunk continuous with.
-        last_sent_motion_token = np.asarray(_INITIAL_TOKEN, dtype=np.float32).copy()
+        last_sent_motion_token = np.asarray(LATENT_INITIAL_MOTION_TOKEN, dtype=np.float32).copy()
+        # No published hand action corresponds to the initial pose, so the prefix goes out
+        # body-only until the first chunk with hands lands. See the note on last_sent_hand_token:
+        # this is the one window where the server still reconstructs (and zero-fills) the hand
+        # columns, and closing it needs an open-hand token from the HandSONIC codec, which does
+        # not live in this repo.
+        last_sent_hand_token = None
         print_green("Sent latent initial pose via ZMQ")
         time.sleep(1.0)
         print("Initial pose done.")
@@ -749,7 +705,7 @@ def main(config: InferenceConfig):
             return False
 
         start_token = last_sent_motion_token.copy()
-        target_token = _INITIAL_TOKEN.copy()
+        target_token = LATENT_INITIAL_MOTION_TOKEN.copy()
         num_steps = max(1, round(config.action_publish_rate * duration_s))
         step_period = 1.0 / config.action_publish_rate
 
@@ -828,6 +784,10 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
+    # Hand half of the last action published, for the RTC prefix. None for a body-only
+    # checkpoint, and None right after 'i' -- the handover case where the server would otherwise
+    # fall back to a zero hand token, which decodes to a curled hand rather than to "unknown".
+    last_sent_hand_token: np.ndarray | None = None
 
     # Real-time chunking: recent inference delays (seconds). `d` is the p90 over this window --
     # biased high, because under-estimating leaves an already-executed tick unfrozen and the
@@ -841,7 +801,7 @@ def main(config: InferenceConfig):
         nonlocal pause_loop, cpp_loop_running, cpp_mode
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
-        nonlocal zmq_frame_counter, last_sent_motion_token
+        nonlocal zmq_frame_counter, last_sent_motion_token, last_sent_hand_token
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -939,6 +899,8 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
                 inspire_reader=inspire_reader,
+                state_q_dev=config.state_q_dev,
+                permute_dex3_hands=config.permute_dex3_hands,
             ),
             lambda obs, options=None: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -993,6 +955,7 @@ def main(config: InferenceConfig):
                         cached_action_chunk=cached_action_chunk,
                         action_chunk_index=action_chunk_index,
                         last_published_token=last_sent_motion_token,
+                        last_published_hand_token=last_sent_hand_token,
                         # While paused (and right after 'i') the cache holds chunks that were
                         # never executed -- the robot is holding the last token it published.
                         holding=pause_loop,
@@ -1052,7 +1015,7 @@ def main(config: InferenceConfig):
                     # Action arrays arrive as (B, T, D) from the model.
                     # Squeeze batch dim to get (T, D), then index by time step.
                     motion_token = np.asarray(
-                        get_action_field(processed_action, _MOTION_TOKEN_KEY),
+                        get_action_field(processed_action, "motion_token"),
                         dtype=np.float32,
                     )
                     if motion_token.ndim == 3:
@@ -1112,6 +1075,16 @@ def main(config: InferenceConfig):
                     )
                     zmq_socket.send(zmq_message)
                     last_sent_motion_token = motion_token.copy()
+                    # Same row index as the body token, so the two halves of the RTC prefix
+                    # describe one action rather than two different ticks.
+                    hand_token_chunk = get_action_field(
+                        processed_action, "hand_token", required=False
+                    )
+                    hand_token_now = select_action_step(hand_token_chunk, current_idx)
+                    last_sent_hand_token = (
+                        None if hand_token_now is None
+                        else np.asarray(hand_token_now, dtype=np.float32).copy()
+                    )
                     if zmq_frame_counter % 50 == 0:
                         print_green(
                             f"ZMQ: Sent latent action - "

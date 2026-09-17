@@ -132,6 +132,14 @@ class InferenceLaunchConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy."""
 
+    rtc: bool = True
+    """Send real-time-chunking options (prev_chunk_tail/delay_ticks) to the policy server.
+    Turn off for a checkpoint with rtc_max_delay=0 (not trained with training-time RTC) --
+    a server given RTC options still pins them even at rtc_max_delay=0, off-distribution,
+    rather than skip pinning on its own (see gr00t_policy._rtc_options_from_robot's own
+    warning). This dataclass previously had no way to forward --no-rtc to
+    run_vla_inference.py at all; --rtc/--no-rtc here now does."""
+
     initial_pose_blend_duration: float = 2.0
     """Duration (seconds) for smooth interpolation to the initial pose when
     pressing 'i'. Higher = slower/smoother. Set to 0 to snap instantly."""
@@ -272,6 +280,7 @@ def main(config: InferenceLaunchConfig):
     print(f"  Prompt:          {config.prompt}")
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
+    print(f"  RTC:             {'on' if config.rtc else 'off'}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
@@ -384,30 +393,20 @@ def main(config: InferenceLaunchConfig):
     # it silently did not, the Inspire reader was never constructed, and the policy got the
     # all-zero dex3 slots as hand proprio with no error anywhere.
     inspire = os.environ.get("SONIC_INSPIRE_HANDS", "0")
-    # SONIC_RTC=0 serves a checkpoint that was never trained for real-time chunking. The server
-    # cannot opt out for us: with rtc_max_delay=0 it skips the trained-range clamp but still sets
-    # rtc_action_prefix from whatever the robot sends, pinning a model that never saw a clean
-    # prefix -- silently (gr00t_policy._announce_rtc says so). The only place to stop it is here,
-    # by not sending the plan at all.
     # inspire (default, pi0.5: the bridge retargets) | dex3 (GR00T: we retarget here)
     hand_space = os.environ.get("SONIC_HAND_SPACE", "inspire")
-    # absolute (pi0.5: the bridge subtracts DEFAULT_MJ) | dev (GR00T: nothing does)
-    state_q = os.environ.get("SONIC_STATE_Q", "absolute")
-    sonic_version = os.environ.get("SONIC_VERSION", "v1.0")
+    # SONIC_EGO_VIDEO, ported from main (fcb58f3): replays a recorded episode instead of the
+    # real camera's ego_view -- see run_vla_inference.py's _ego_video_frame. Panes are fresh
+    # shells under the tmux server (same reason SONIC_INSPIRE_HANDS is re-exported above), so
+    # this has to be forwarded explicitly too, not just set in the invoking shell.
     ego_video = os.environ.get("SONIC_EGO_VIDEO", "")
-    rtc_flag = "" if os.environ.get("SONIC_RTC", "1") != "0" else "--no-rtc "
-    if rtc_flag:
-        print("[rtc] SONIC_RTC=0 -> passing --no-rtc; the robot will not send its executing plan")
     inference_cmd = (
         f"cd {repo_root} && "
         f"source .venv_inference/bin/activate && "
         f"export SONIC_INSPIRE_HANDS={inspire} && "
         f"export SONIC_HAND_SPACE={hand_space} && "
-        f"export SONIC_STATE_Q={state_q} && "
-        f"export SONIC_VERSION={sonic_version} && "
         f"export SONIC_EGO_VIDEO='{ego_video}' && "
         f"python gear_sonic/scripts/run_vla_inference.py "
-        f"{rtc_flag}"
         f"--host {config.policy_host} "
         f"--port {config.policy_port} "
         f"--embodiment-tag {config.embodiment_tag} "
@@ -416,7 +415,8 @@ def main(config: InferenceLaunchConfig):
         f"--action-horizon {config.action_horizon} "
         f"--initial-pose-blend-duration {config.initial_pose_blend_duration} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"{'--rtc' if config.rtc else '--no-rtc'}"
     )
 
     print("Starting VLA inference (pane 1)...")

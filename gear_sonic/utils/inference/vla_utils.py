@@ -10,6 +10,39 @@ import numpy as np
 
 from gear_sonic.data.robot_model.robot_model import RobotModel
 
+# --- SONIC state conventions -------------------------------------------------------------
+# Every SONIC VLA corpus (EgoSuite, Humanoid-Everyday, PSI, UnifoLM, LeVERB) stores
+# `observation.state` body joints as q_dev = q - DEFAULT_ANGLES_MJ, and a GR00T server consumes
+# state VERBATIM -- unlike the pi0.5 bridge, it has no conversion step of its own. So the robot
+# has to send q_dev. Sending raw q instead shifts the observation by ~0.669 rad at both knees
+# and 0.363 at the ankles, which is 0.71 / 0.65 of those dims' full normalized [-1, 1] span --
+# and it does so SILENTLY: at the corpus mean pose nothing lands outside [q01, q99], so no clip
+# fires and no warning is printed. The policy simply sees a robot that is permanently crouched
+# relative to anything it was trained on.
+#
+# Layout is SONIC-grouped: left_leg(6) right_leg(6) waist(3) left_arm(7) right_arm(7).
+# `get_joint_group_indices` returns each group already in SONIC intra-group order, so slicing
+# per group and subtracting the matching slice here needs no index permutation.
+DEFAULT_ANGLES_MJ = {
+    "left_leg": np.array([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0], dtype=np.float32),
+    "right_leg": np.array([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0], dtype=np.float32),
+    "waist": np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    "left_arm": np.array([0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0], dtype=np.float32),
+    "right_arm": np.array([0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0], dtype=np.float32),
+}
+BODY_GROUPS = ("left_leg", "right_leg", "waist", "left_arm", "right_arm")
+
+# Per-hand THUMB-FIRST -> INDEX-FIRST. The G1 URDF declares each hand as
+# [thumb_0, thumb_1, thumb_2, middle_0, middle_1, index_0, index_1] and
+# `get_joint_group_indices` returns sorted model dof indices, i.e. that declaration order.
+# The dex3 space the models were trained on -- HandSONIC's, which produced the hand block of
+# every corpus's state -- is index-first: [index_0, index_1, middle_0, middle_1, t0, t1, t2].
+# Without this, thumb_0 (signed, +-1.05) lands in the index_0 slot (window [-1.435, 0.152]):
+# 3 of 7 dims outside [q01, q99], normalized error up to 1.35 of a 2.0-wide window, every tick.
+# Same array and same reason as the pi0.5 bridge's `_DEX3_FROM_ROBOT`.
+DEX3_FROM_ROBOT = np.array([5, 6, 3, 4, 0, 1, 2])
+HAND_GROUPS = ("left_hand", "right_hand")
+
 
 def concat_action(robot_model: RobotModel, goal: Dict[str, Any]) -> Dict[str, Any]:
     """Process the action dict from the policy into a flat dict.
@@ -29,16 +62,33 @@ def concat_action(robot_model: RobotModel, goal: Dict[str, Any]) -> Dict[str, An
     return processed_goal
 
 
-def prepare_observation_for_eval(robot_model: RobotModel, obs: dict) -> dict:
+def prepare_observation_for_eval(
+    robot_model: RobotModel,
+    obs: dict,
+    q_dev: bool = True,
+    permute_dex3_hands: bool = True,
+) -> dict:
     """Split whole-body ``q`` into per-joint-group state keys for the policy.
 
     Populates ``obs["state"]`` with ``left_arm``, ``right_arm``, ``waist``,
     ``left_leg``, ``right_leg``, ``left_hand``, ``right_hand`` sub-keys
     using the nested dict format expected by ``Gr00tPolicy``.
 
+    Two conversions happen here, both because a GR00T server consumes state VERBATIM and so the
+    robot must hand it the exact convention the checkpoint was trained on. See DEFAULT_ANGLES_MJ
+    and DEX3_FROM_ROBOT above for the measured cost of getting either wrong; both are silent.
+
     Args:
         robot_model: RobotModel instance.
         obs: Observation dict containing ``"q"`` key and a ``"state"`` sub-dict.
+        q_dev: subtract DEFAULT_ANGLES_MJ from the five body groups. True for every SONIC
+            checkpoint. Turn it off only for a policy demonstrably trained on absolute q --
+            check the run's ``experiment_cfg/dataset_statistics.json``: a knee (``left_leg``
+            index 3) mean near 0 is q_dev, near +0.67 is absolute.
+        permute_dex3_hands: reorder each 7-wide hand group from the URDF's thumb-first
+            declaration order into HandSONIC's index-first dex3 order. Applied only to groups
+            that are actually 7 wide, so a 6-wide Inspire vector written over these slots
+            downstream is left alone.
 
     Returns:
         Modified observation dict with ``obs["state"]`` populated.
@@ -51,13 +101,21 @@ def prepare_observation_for_eval(robot_model: RobotModel, obs: dict) -> dict:
     if "state" not in obs:
         obs["state"] = {}
 
-    obs["state"]["left_arm"] = whole_q[..., robot_model.get_joint_group_indices("left_arm")]
-    obs["state"]["right_arm"] = whole_q[..., robot_model.get_joint_group_indices("right_arm")]
-    obs["state"]["waist"] = whole_q[..., robot_model.get_joint_group_indices("waist")]
-    obs["state"]["left_leg"] = whole_q[..., robot_model.get_joint_group_indices("left_leg")]
-    obs["state"]["right_leg"] = whole_q[..., robot_model.get_joint_group_indices("right_leg")]
-    obs["state"]["left_hand"] = whole_q[..., robot_model.get_joint_group_indices("left_hand")]
-    obs["state"]["right_hand"] = whole_q[..., robot_model.get_joint_group_indices("right_hand")]
+    for group in BODY_GROUPS:
+        values = whole_q[..., robot_model.get_joint_group_indices(group)]
+        if q_dev:
+            default = DEFAULT_ANGLES_MJ[group]
+            assert values.shape[-1] == default.shape[0], (
+                f"{group} has {values.shape[-1]} joints, DEFAULT_ANGLES_MJ has {default.shape[0]}"
+            )
+            values = values - default
+        obs["state"][group] = values
+
+    for group in HAND_GROUPS:
+        values = whole_q[..., robot_model.get_joint_group_indices(group)]
+        if permute_dex3_hands and values.shape[-1] == DEX3_FROM_ROBOT.shape[0]:
+            values = values[..., DEX3_FROM_ROBOT]
+        obs["state"][group] = values
 
     return obs
 
@@ -119,6 +177,7 @@ def build_prev_chunk_tail(
     last_published_token: Any,
     holding: bool,
     action_horizon: int | None = None,
+    last_published_hand_token: Any = None,
 ) -> "np.ndarray | None":
     """The motion tokens this robot will execute if no new chunk ever arrives.
 
@@ -155,7 +214,8 @@ def build_prev_chunk_tail(
     if holding or cached_action_chunk is None:
         if last_published_token is None:
             return None
-        return np.asarray(last_published_token, dtype=np.float32).reshape(1, -1)
+        row = np.asarray(last_published_token, dtype=np.float32).reshape(1, -1)
+        return _append_hand_half(row, last_published_hand_token)
 
     # Same two-key lookup as run_vla_inference.get_action_field; inlined to avoid importing
     # from the script (which imports this module).
@@ -165,7 +225,8 @@ def build_prev_chunk_tail(
     if tokens is None:
         if last_published_token is None:
             return None
-        return np.asarray(last_published_token, dtype=np.float32).reshape(1, -1)
+        row = np.asarray(last_published_token, dtype=np.float32).reshape(1, -1)
+        return _append_hand_half(row, last_published_hand_token)
 
     tokens = np.asarray(tokens, dtype=np.float32)
     while tokens.ndim > 2:  # (B, T, D) -> (T, D)
@@ -180,7 +241,41 @@ def build_prev_chunk_tail(
     last = tokens.shape[0] if action_horizon is None else min(int(action_horizon), tokens.shape[0])
     last = max(last, 1)
     start = int(np.clip(action_chunk_index, 0, last - 1))
-    return tokens[start:last]
+    tail = tokens[start:last]
+
+    # HAND HALF. A `*_sonic_hand` checkpoint acts in 128 dims (motion_token ++ hand_token, in
+    # the order `conf.yaml` declares them) and the server pins the WHOLE action vector or
+    # nothing. Sending only the body 64 makes the server reconstruct the hand columns by
+    # searching its own last chunk for a row whose first 64 dims match -- which succeeds while
+    # running, but falls through to ZEROS right after 'i', when its cache was just cleared.
+    # A zero hand token is not "no information": decoded it is a hand curled to 45-84% of range.
+    # So the prefix would pin "make a fist" at exactly the idle -> VLA handover. Send the hand
+    # half ourselves whenever the plan in force has one.
+    hand = cached_action_chunk.get("hand_token")
+    if hand is None:
+        hand = cached_action_chunk.get("action.hand_token")
+    if hand is None:
+        return tail
+    hand = np.asarray(hand, dtype=np.float32)
+    while hand.ndim > 2:
+        hand = hand[0]
+    if hand.ndim != 2 or hand.shape[0] < last:
+        return tail
+    return np.concatenate([tail, hand[start:last]], axis=-1)
+
+
+def _append_hand_half(body_row: "np.ndarray", hand_token: Any) -> "np.ndarray":
+    """Widen a single held body token to the model's full action width, when we know the hand.
+
+    Mirrors the running case above. `hand_token` is the hand half of the last action actually
+    published; None for a body-only checkpoint, or before anything with hands has been sent.
+    """
+    if hand_token is None:
+        return body_row
+    hand = np.asarray(hand_token, dtype=np.float32).reshape(1, -1)
+    if hand.shape[0] != body_row.shape[0]:
+        return body_row
+    return np.concatenate([body_row, hand], axis=-1)
 
 
 def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: int,
