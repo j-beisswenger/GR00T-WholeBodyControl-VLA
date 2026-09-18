@@ -155,6 +155,15 @@ class InferenceConfig:
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
 
+    chunk_log_dir: str = "outputs/vla_chunks"
+    """Where to write the per-episode .npz of chunks AS RECEIVED from the policy server.
+
+    One file per recorded episode, holding every chunk with its frame_index, receive time,
+    measured inference delay, and the latency-compensated row publishing started at. The dataset
+    records only the token executed each tick -- the chunks already stitched together -- so the
+    superseded tail of a replanned chunk exists nowhere else, and that tail is what chunk-
+    boundary and RTC analysis needs. Joins to the dataset on `action.frame_index`."""
+
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
@@ -170,6 +179,7 @@ def pack_latent_action_message(
     frame_index: np.ndarray,
     left_hand_joints: np.ndarray = None,
     right_hand_joints: np.ndarray = None,
+    hand_token: np.ndarray = None,
 ) -> bytes:
     """Pack a single motion-token action into a ZMQ message (Protocol v4).
 
@@ -223,6 +233,19 @@ def pack_latent_action_message(
                 )
             val = val.reshape(1, -1)
         pose_data[name] = val
+
+    # The HandSONIC latent itself, for the recording only. `vla_left/right_hand_joints` above are
+    # what this token DECODES to, and the decode is lossy and codec-version dependent, so the
+    # joints alone cannot reconstruct it. The training corpora store `action.hand_token` beside
+    # `action.motion_token` (it is literally half of a *_sonic_hand checkpoint's action), so an
+    # episode recorded without it is not in the same space as the data these models train on.
+    # Same `vla_` naming rule as above: an unknown field name is skipped by the C++ header walk,
+    # so this reaches the exporter and never the controller.
+    if hand_token is not None:
+        ht = np.asarray(hand_token, dtype=np.float32)
+        if ht.ndim == 1:
+            ht = ht.reshape(1, -1)
+        pose_data["vla_hand_token"] = ht
 
     return pack_pose_message(pose_data, topic="pose", version=4)
 
@@ -787,6 +810,43 @@ def main(config: InferenceConfig):
             return False
 
     recording_active = False
+    chunk_log = []           # one entry per chunk RECEIVED while an episode is open
+
+    def flush_chunk_log(reason: str):
+        """Write the episode's received chunks to an .npz beside the dataset, then clear.
+
+        WHY A SIDECAR and not a dataset column: a chunk is (action_horizon, action_dim) and
+        arrives at the ~2.5 Hz replan rate, while the dataset is a flat 50 Hz per-frame table.
+        Storing it per frame would either duplicate a 40x128 array 20x or need a ragged column.
+        `action.frame_index` is recorded in the dataset and stamped here, so the two join.
+
+        Kept because the recorded stream CANNOT reconstruct it: the dataset holds the token
+        actually executed each tick, i.e. the chunks already stitched together. The tail of a
+        chunk that a replan superseded is discarded and appears nowhere -- and that tail is
+        exactly what you need to study chunk-boundary behaviour or verify RTC pinning offline.
+        """
+        nonlocal chunk_log
+        if not chunk_log:
+            return
+        try:
+            d = pathlib.Path(config.chunk_log_dir).expanduser()
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f"chunks_{time.strftime('%Y%m%d_%H%M%S')}.npz"
+            np.savez_compressed(
+                path,
+                # (N, H, D) only if every chunk shares a shape; object array otherwise, which
+                # np.savez handles and a reader can ragged-iterate.
+                chunks=np.asarray([c["chunk"] for c in chunk_log], dtype=np.float32),
+                frame_index=np.asarray([c["frame_index"] for c in chunk_log], dtype=np.int64),
+                recv_time=np.asarray([c["recv_time"] for c in chunk_log], dtype=np.float64),
+                inference_delay=np.asarray([c["delay"] for c in chunk_log], dtype=np.float64),
+                start_index=np.asarray([c["start_index"] for c in chunk_log], dtype=np.int64),
+                prompt=np.asarray([c["prompt"] for c in chunk_log]),
+            )
+            print_green(f"[chunks] wrote {len(chunk_log)} chunks -> {path} ({reason})")
+        except Exception as e:  # noqa: BLE001 -- logging must never break the control loop
+            print(f"Warning: failed to write chunk log: {e}")
+        chunk_log = []
 
     def publish_record_command(start: bool, why: str):
         """Tell the data exporter to open or close an episode. Idempotent, fire-and-forget.
@@ -805,10 +865,14 @@ def main(config: InferenceConfig):
         Idempotence is enforced here rather than in the exporter: `EpisodeState.change_state()`
         is a 3-state CYCLE, so a duplicate start/stop would advance it into the wrong state.
         """
-        nonlocal recording_active
+        nonlocal recording_active, chunk_log
         if start == recording_active:
             return
         recording_active = start
+        if start:
+            chunk_log = []               # a new episode starts from an empty log
+        else:
+            flush_chunk_log(why)         # close the episode's sidecar alongside it
         try:
             zmq_socket.send_string(f"record:{'start' if start else 'stop'}")
             print_green(f"[record] {'START' if start else 'STOP'} episode ({why})")
@@ -985,6 +1049,32 @@ def main(config: InferenceConfig):
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 logged_awaiting_chunk = False
+                if recording_active:
+                    # The chunk AS RECEIVED, before the publish loop walks it. `start_index` is
+                    # the latency-compensated row publishing begins at, so rows before it are
+                    # never executed and rows after `start_index + ticks-until-next-chunk` are
+                    # superseded -- neither is recoverable from the dataset.
+                    try:
+                        mt = np.asarray(get_action_field(processed_action, "motion_token"),
+                                        dtype=np.float32)
+                        if mt.ndim == 3:
+                            mt = mt[0]
+                        ht = get_action_field(processed_action, "hand_token", required=False)
+                        if ht is not None:
+                            ht = np.asarray(ht, dtype=np.float32)
+                            if ht.ndim == 3:
+                                ht = ht[0]
+                            mt = np.concatenate([mt, ht], axis=-1)   # motion ++ hand, as trained
+                        chunk_log.append({
+                            "chunk": mt,
+                            "frame_index": int(zmq_frame_counter),
+                            "recv_time": time.time(),
+                            "delay": float(inference_delay),
+                            "start_index": int(action_chunk_index),
+                            "prompt": language_prompt_ref[0],
+                        })
+                    except Exception as e:  # noqa: BLE001 -- never break the loop for logging
+                        print(f"Warning: chunk log skipped a chunk: {e}")
                 # Break the latency down. The hands now sit on their own Modbus thread, so a
                 # hand stall no longer lands INSIDE this number -- but it is still the thing
                 # people suspect first, so report it next to the number it used to inflate.
@@ -1118,6 +1208,15 @@ def main(config: InferenceConfig):
                         current_idx,
                     )
 
+                    # Pulled up from below the send: the token now RIDES the pose message, so it
+                    # has to exist before the message is packed. Same row index as the body
+                    # token, so the two halves of the RTC prefix describe one action rather than
+                    # two different ticks.
+                    hand_token_chunk = get_action_field(
+                        processed_action, "hand_token", required=False
+                    )
+                    hand_token_now = select_action_step(hand_token_chunk, current_idx)
+
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
 
@@ -1148,15 +1247,10 @@ def main(config: InferenceConfig):
                         frame_index,
                         left_hand_joints=left_hand_joints,
                         right_hand_joints=right_hand_joints,
+                        hand_token=hand_token_now,
                     )
                     zmq_socket.send(zmq_message)
                     last_sent_motion_token = motion_token.copy()
-                    # Same row index as the body token, so the two halves of the RTC prefix
-                    # describe one action rather than two different ticks.
-                    hand_token_chunk = get_action_field(
-                        processed_action, "hand_token", required=False
-                    )
-                    hand_token_now = select_action_step(hand_token_chunk, current_idx)
                     last_sent_hand_token = (
                         None if hand_token_now is None
                         else np.asarray(hand_token_now, dtype=np.float32).copy()
@@ -1185,8 +1279,14 @@ def main(config: InferenceConfig):
         print("VLA inference loop terminated by user")
 
     finally:
+        # An episode left open by Ctrl-C still has its chunks in memory; write them before the
+        # sockets go. The exporter saves its own side on the same interrupt, so losing only this
+        # half would leave a dataset episode with no sidecar.
+        flush_chunk_log("shutdown")
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
+        if inspire_reader is not None:
+            inspire_reader.close()          # stop the Modbus threads cleanly
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()

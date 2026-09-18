@@ -266,6 +266,22 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (64,),
             "names": "motion_token",
         },
+        # The hand half of a *_sonic_hand checkpoint's action. The corpora store this beside
+        # motion_token, and `vla_left/right_hand_joints` are what it DECODES to -- lossily, and
+        # through a specific codec version -- so the joints cannot stand in for it.
+        "action.hand_token": {
+            "dtype": "float64",
+            "shape": (64,),
+            "names": "hand_token",
+        },
+        # The publish-loop frame counter this row was recorded against. Joins the row to the
+        # per-inference chunk sidecar run_vla_inference writes (chunks are ~2.5 Hz and (H, D)
+        # shaped, so they cannot live in this per-frame schema). -1 = nothing published yet.
+        "action.frame_index": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": ["frame_index"],
+        },
         "teleop.smpl_joints": {
             "dtype": "float32",
             "shape": (72,),

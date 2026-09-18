@@ -475,14 +475,27 @@ class GrootDataCollector:
         if "token_state" in pose_data and "smpl_joints" not in pose_data:
             left = self._extract_hand_joints(pose_data, "vla_left_hand_joints")
             right = self._extract_hand_joints(pose_data, "vla_right_hand_joints")
-            if left is not None or right is not None:
+            # The HandSONIC latent the joints above were decoded FROM. Recorded because it is
+            # half of a *_sonic_hand checkpoint's action (`motion_token ++ hand_token`) and the
+            # corpora store it, so an episode without it is not in the space these models train
+            # on -- and the decode is lossy, so it cannot be recovered from the joints.
+            hand_token = None
+            if "vla_hand_token" in pose_data:
+                hand_token = np.asarray(pose_data["vla_hand_token"]).flatten().astype(np.float64)
+            # The join key for the per-inference chunk sidecar that run_vla_inference writes.
+            fi = None
+            if "frame_index" in pose_data:
+                fi = int(np.asarray(pose_data["frame_index"]).flat[0])
+            if left is not None or right is not None or hand_token is not None:
                 # Width IS the hand space: 7 = dex3, 6 = Inspire. Recorded alongside the values
                 # because the two mean different joints and the column is a fixed 7 wide.
-                dof = len(left) if left is not None else len(right)
+                dof = len(left) if left is not None else (len(right) if right is not None else 0)
                 self.latest_vla_hand_msg = {
                     "left_hand_joints": left,
                     "right_hand_joints": right,
                     "hand_dof": dof,
+                    "hand_token": hand_token,
+                    "frame_index": fi,
                     "receive_timestamp": time.time(),
                 }
             return
@@ -729,6 +742,20 @@ class GrootDataCollector:
             frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+
+        # The hand half of the action, and the frame index that joins this row to the
+        # per-inference chunk sidecar. Both ride the VLA pose message; zeros/-1 when the policy
+        # is body-only or nothing has been published yet, which is in-distribution for the hand
+        # token (a hand-less corpus trained on exactly that) and unambiguous for the index.
+        vla = self.latest_vla_hand_msg
+        ht = vla.get("hand_token") if vla else None
+        frame_data["action.hand_token"] = (
+            np.asarray(ht, dtype=np.float64) if ht is not None
+            else np.zeros(64, dtype=np.float64)
+        )
+        fi = vla.get("frame_index") if vla else None
+        frame_data["action.frame_index"] = np.array(
+            [fi if fi is not None else -1], dtype=np.int64)
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
