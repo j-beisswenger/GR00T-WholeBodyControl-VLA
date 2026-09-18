@@ -786,6 +786,35 @@ def main(config: InferenceConfig):
             print(f"Warning: Failed to send {action_str} command message: {e}")
             return False
 
+    recording_active = False
+
+    def publish_record_command(start: bool, why: str):
+        """Tell the data exporter to open or close an episode. Idempotent, fire-and-forget.
+
+        WHY HERE: recording should bracket the part of a run where the robot is actually driven
+        by the policy, and only THIS process knows when that is. 'p' is a toggle whose meaning
+        depends on `pause_loop`, and 'i' and 'k' stop driving without touching 'p' at all -- an
+        exporter watching raw keys cannot reconstruct any of that, especially since its keyboard
+        socket is CONFLATE=1 and drops keys it did not poll in time.
+
+        Sent on the ACTION socket under a `record` topic rather than a new port. The C++ control
+        loop subscribes to that same socket with the prefix filter "pose"
+        (`zmq_packed_message_subscriber.hpp`), so ZMQ drops this message before it ever reaches
+        the realtime path; the exporter subscribes to `record` explicitly and gets it.
+
+        Idempotence is enforced here rather than in the exporter: `EpisodeState.change_state()`
+        is a 3-state CYCLE, so a duplicate start/stop would advance it into the wrong state.
+        """
+        nonlocal recording_active
+        if start == recording_active:
+            return
+        recording_active = start
+        try:
+            zmq_socket.send_string(f"record:{'start' if start else 'stop'}")
+            print_green(f"[record] {'START' if start else 'STOP'} episode ({why})")
+        except Exception as e:  # noqa: BLE001 -- recording must never break the control loop
+            print(f"Warning: failed to send record command: {e}")
+
     # Async inference state
     cached_action_chunk = None
     action_chunk_index = 0
@@ -849,6 +878,9 @@ def main(config: InferenceConfig):
             elif not cpp_loop_running:
                 print("Note: C++ loop not running - press 'k' to start")
 
+            # Close any open episode BEFORE the blend: going to the initial pose is not part of
+            # the demonstration, and 'i' always re-pauses, so this is a trial boundary.
+            publish_record_command(False, "initial pose")
             pause_loop = True
             if config.initial_pose_blend_duration > 0 and last_sent_motion_token is not None:
                 blend_to_initial_pose(config.initial_pose_blend_duration)
@@ -866,14 +898,17 @@ def main(config: InferenceConfig):
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
             if pause_loop:
                 print("Policy loop paused (C++ loop still running - press 'k' to stop)")
+                publish_record_command(False, "paused")
             else:
                 print("Policy loop resumed")
+                publish_record_command(True, "resumed")
         elif key == "k":
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
                 print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
                 if send_cpp_control_command(start=False, planner=current_planner):
                     print("Stopped C++ control loop")
+                    publish_record_command(False, "C++ loop stopped")
             else:
                 print("Starting C++ control loop in PLANNER mode...")
                 if send_cpp_control_command(start=True, planner=True):

@@ -270,6 +270,10 @@ class GrootDataCollector:
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+            # Automatic episode bracketing driven by run_vla_inference.py: it opens an episode
+            # when the policy loop resumes and closes it on pause / 'i' / 'k'. See
+            # `publish_record_command` there for why that process is the one that decides.
+            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "record")
             time.sleep(0.5)
             print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
             print("[Sonic] Subscribed to: pose, planner, manager_state")
@@ -353,8 +357,33 @@ class GrootDataCollector:
                 self._handle_manager_state(raw)
             elif raw.startswith(b"planner"):
                 self._handle_planner_message(raw)
+            elif raw.startswith(b"record"):
+                self._handle_record_command(raw)
             elif raw.startswith(b"pose"):
                 self._handle_pose_message(raw)
+
+    def _handle_record_command(self, raw: bytes) -> None:
+        """`record:start` / `record:stop` from run_vla_inference.py -> the episode state machine.
+
+        Drives the SAME states 'c' drives, so manual and automatic recording cannot diverge, but
+        addressed absolutely rather than as a toggle: `change_state()` cycles IDLE -> RECORDING
+        -> NEED_TO_SAVE -> IDLE, so it is only advanced when the requested edge actually differs
+        from the current state. A stop while NEED_TO_SAVE is already pending is a no-op -- the
+        main loop is mid-save and advancing again would drop the episode back to IDLE unsaved.
+        """
+        cmd = raw.decode(errors="replace").strip()
+        want_recording = cmd.endswith("start")
+        state = self._episode_state.get_state()
+        if want_recording:
+            if state == self._episode_state.IDLE:
+                self._episode_state.change_state()          # -> RECORDING
+                self._initial_yaw = None
+                self._print_and_say(
+                    f"Started recording {self.current_episode_index}", blocking=False)
+        else:
+            if state == self._episode_state.RECORDING:
+                self._episode_state.change_state()          # -> NEED_TO_SAVE
+                self._print_and_say("Stopping recording, preparing to save", blocking=False)
 
     def _handle_manager_state(self, raw: bytes) -> None:
         try:
