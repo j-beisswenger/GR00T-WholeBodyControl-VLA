@@ -946,9 +946,29 @@ def main(config: InferenceConfig):
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 logged_awaiting_chunk = False
+                # Break the latency down. The hands now sit on their own Modbus thread, so a
+                # hand stall no longer lands INSIDE this number -- but it is still the thing
+                # people suspect first, so report it next to the number it used to inflate.
+                # `rest` is everything this delay actually consists of now: observation build,
+                # the server round-trip, and post-processing.
+                hands_note = ""
+                if inspire_reader is not None:
+                    s = inspire_reader.stats()
+                    if s["disabled"]:
+                        hands_note = " | hands DISABLED"
+                    else:
+                        hands_note = (
+                            f" | hands@{s['hz']:.0f}Hz age {s['age_ms']:.0f}ms"
+                            f" | L r{s['read_left'][0]:.0f}/{s['read_left'][1]:.0f}"
+                            f" w{s['write_left'][0]:.0f}/{s['write_left'][1]:.0f}"
+                            f" | R r{s['read_right'][0]:.0f}/{s['read_right'][1]:.0f}"
+                            f" w{s['write_right'][0]:.0f}/{s['write_right'][1]:.0f}"
+                            f" | tick {s['tick'][0]:.0f}/{s['tick'][1]:.0f}ms"
+                            f" over {s['overruns']}"
+                        )
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", '
-                    f"latency: {inference_delay:.3f}s)"
+                    f"latency: {inference_delay:.3f}s = rest, hands off-path){hands_note}"
                 )
             except queue.Empty:
                 pass

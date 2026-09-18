@@ -33,8 +33,10 @@ CONVENTIONS (all verified against the sources named, except where flagged)
 """
 from __future__ import annotations
 
+import collections
 import os
 import pathlib
+import threading
 import time
 
 import numpy as np
@@ -139,19 +141,27 @@ def to_dex3(left6, right6):
 class InspireHandReader:
     """Lazily-connected reader for both hands. Never raises into the control loop.
 
-    `read()` returns `(left6, right6)` in radians, or `None` if either hand is unavailable --
-    the caller then leaves the observation untouched rather than feeding the policy a guess.
+    ALL Modbus I/O happens on ONE dedicated thread (`_loop`, `SONIC_INSPIRE_HZ`, default 30).
+    `read()` and `write()` are pure shared-memory accesses that never touch the socket:
+    `read()` returns the newest values the thread managed to fetch, `write()` parks a target the
+    thread picks up on its next tick (latest-wins, never queued).
 
-    `read()` is rate-limited the same way `write()` already was: `SONIC_INSPIRE_READ_HZ`
-    (default 20) sets a ceiling on actual Modbus round-trips, and a call in between returns the
-    last successfully-polled reading. Before this, `read()` had NO throttle at all and was
-    called unconditionally once per observation-prep tick -- i.e. up to `action_publish_rate`
-    (default 50 Hz) -- issuing two sequential BLOCKING Modbus transactions per call (left hand,
-    then right hand: up to 100 round-trips/sec sustained to an embedded servo controller). Read
-    and write failures share one `_fails` counter, and `_give_up` disables the hands for the
-    rest of the run after just 3 consecutive failures (read OR write) -- so an unthrottled read
-    path alone was enough to trip that and produce "hands stop responding" with the write path
-    never at fault.
+    WHY A THREAD, not just a rate limit. These calls used to run inline, and pymodbus's TCP
+    client is synchronous, so a hand that went quiet cost its full socket timeout -- seconds --
+    charged to whichever loop called it. That landed in two bad places at once:
+      * `read()` runs inside the INFERENCE worker, whose elapsed time IS the `delay_ticks` fed
+        to real-time chunking. A stalled hand therefore inflated the RTC delay estimate and
+        tripped the "delay > trained max; clamping" path, i.e. a hand fault degraded BODY
+        control.
+      * `write()` runs in the 50 Hz publish loop, so a stall there stalled body publishing
+        outright.
+    Rate-limiting (the previous fix) only reduced how OFTEN that exposure occurred; it could not
+    remove it, because a due tick still blocked. Decoupling removes it: a stalled hand now costs
+    stale values in the shared slot for the duration, and nothing else waits.
+
+    Read and write failures share one `_fails` counter, and `_give_up` latches the hands off for
+    the rest of the run after 3 consecutive failures -- unchanged, but now it stops the thread
+    rather than the control loop.
     """
 
     def __init__(self, left_host: str = LEFT_HOST, right_host: str = RIGHT_HOST, port: int = PORT):
@@ -159,15 +169,26 @@ class InspireHandReader:
         self._port = port
         self._clients = None
         self._warned = False
-        self._write_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_WRITE_HZ", "20"))
-        self._last_write = 0.0
-        self._read_period = 1.0 / float(os.environ.get("SONIC_INSPIRE_READ_HZ", "20"))
-        self._last_read = 0.0
-        self._cached_hands = None    # last successful (left6, right6); served on throttled polls
         self._unit_kw = None      # "slave" (pymodbus 3.x) or "device_id" (4.x); detected once
         self._fails = 0
         self._disabled = False
         self._announced = False
+
+        # --- the shared slots between the Modbus thread and the control path ---------------
+        self._hz = float(os.environ.get("SONIC_INSPIRE_HZ", "30"))
+        self._period = 1.0 / self._hz
+        self._lock = threading.Lock()
+        self._latest = None       # newest successful read (left6, right6); None until first
+        self._latest_t = 0.0      # time.monotonic() of that read, for staleness reporting
+        self._target = None       # newest commanded (left6, right6); latest-wins, never queued
+        self._thread = None
+        self._stop = threading.Event()
+        self._wrote_once = threading.Event()   # open_hands() waits on this at startup
+        # Per-operation durations, so a stall can be attributed to a SPECIFIC hand rather than
+        # to "the hands". Each is a window of recent seconds; `stats()` reduces them.
+        self._t = {k: collections.deque(maxlen=200)
+                   for k in ("read_left", "read_right", "write_left", "write_right", "tick")}
+        self._overruns = 0        # ticks that took longer than the period
 
     def _connect(self) -> bool:
         if self._disabled:
@@ -220,72 +241,156 @@ class InspireHandReader:
             print(f"[inspire] giving up after {self._fails} failures ({why}); hands DISABLED "
                   "for this run", flush=True)
 
-    def read(self):
-        """Poll both hands, rate-limited to `SONIC_INSPIRE_READ_HZ` (default 20).
+    # --- the Modbus thread ----------------------------------------------------------------
 
-        A call in between polls returns the cached reading from the last successful poll
-        (`self._cached_hands`), not a fresh Modbus round-trip -- so the caller can call this
-        every tick at any loop rate and the actual device traffic still stays bounded. Only a
-        REAL failure (connect/transport/error-response) returns None, same as before; a
-        throttled call is not a failure and does not touch `_fails`.
+    def start(self) -> None:
+        """Spawn the Modbus thread. Idempotent; called lazily by read()/write()."""
+        if self._thread is not None or self._disabled:
+            return
+        self._thread = threading.Thread(target=self._loop, name="inspire-modbus", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        """Own the sockets; read both hands and push the latest target, every `_period`.
+
+        DAEMON + latest-wins by design. Nothing here is allowed to make the caller wait: a hand
+        that stalls for its full socket timeout costs stale values in `_latest` for that long,
+        and the control loop keeps publishing body joints at 50 Hz throughout.
         """
-        now = time.monotonic()
-        if self._cached_hands is not None and now - self._last_read < self._read_period:
-            return self._cached_hands
-        if not self._connect():
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            if not self._connect():
+                # Not reachable (or pymodbus missing / given up). Don't spin: _connect already
+                # printed once, and _give_up latches _disabled.
+                if self._disabled:
+                    return
+                self._stop.wait(self._period)
+                continue
+
+            left = self._read_one(0, "read_left")
+            right = self._read_one(1, "read_right")
+            if left is not None and right is not None:
+                with self._lock:
+                    self._latest, self._latest_t = (left, right), time.monotonic()
+                self._fails = 0
+
+            with self._lock:
+                target = self._target
+            if target is not None:
+                ok_l = self._write_one(0, target[0], "write_left")
+                ok_r = self._write_one(1, target[1], "write_right")
+                if ok_l and ok_r:
+                    self._wrote_once.set()
+                    self._fails = 0
+
+            dt = time.monotonic() - t0
+            self._t["tick"].append(dt)
+            if dt > self._period:
+                self._overruns += 1
+            self._stop.wait(max(0.0, self._period - dt))
+
+    def _read_one(self, idx: int, key: str):
+        c = self._clients[idx] if self._clients else None
+        if c is None:
             return None
-        out = []
-        for c in self._clients:
-            try:
-                rr = c.read_holding_registers(REG_ACTUAL, count=N_FINGERS,
-                                              **{self._unit_kw: 1})
-            except Exception as exc:                      # transport hiccup: drop the sample
-                if self._fails == 0:
-                    print(f"[inspire] read failed ({exc})", flush=True)
-                self._give_up(str(exc))
-                return None
-            if rr is None or getattr(rr, "isError", lambda: True)():
-                self._give_up("modbus error response")
-                return None
-            out.append(_ctrl_to_rad(rr.registers))
-        self._fails = 0
-        self._last_read = now
-        self._cached_hands = (out[0], out[1])
-        return self._cached_hands
+        t0 = time.monotonic()
+        try:
+            rr = c.read_holding_registers(REG_ACTUAL, count=N_FINGERS, **{self._unit_kw: 1})
+        except Exception as exc:                          # transport hiccup: drop the sample
+            self._t[key].append(time.monotonic() - t0)
+            if self._fails == 0:
+                print(f"[inspire] read failed ({exc})", flush=True)
+            self._give_up(str(exc))
+            return None
+        self._t[key].append(time.monotonic() - t0)
+        if rr is None or getattr(rr, "isError", lambda: True)():
+            self._give_up("modbus error response")
+            return None
+        return _ctrl_to_rad(rr.registers)
 
-    def write(self, left6, right6) -> bool:
-        """Command both hands. Returns False if the write did not reach the hardware.
-
-        Rate-limited: the control loop publishes at 50 Hz, far faster than these servos need or
-        than Modbus TCP round-trips comfortably sustain, and a backed-up socket would stall the
-        loop it is called from. `SONIC_INSPIRE_WRITE_HZ` (default 20) sets the ceiling; ticks
-        in between are dropped, not queued, so the hands always track the LATEST target.
-        """
-        if not self._connect():
+    def _write_one(self, idx: int, q6, key: str) -> bool:
+        c = self._clients[idx] if self._clients else None
+        if c is None:
             return False
-        now = time.monotonic()
-        if now - self._last_write < self._write_period:
-            return True                                   # skipped by design, not a failure
-        self._last_write = now
-        for c, q in zip(self._clients, (left6, right6)):
-            regs = _rad_to_ctrl(q)
-            try:
-                rr = c.write_registers(REG_TARGET, regs.tolist(), **{self._unit_kw: 1})
-            except Exception as exc:
-                if self._fails == 0:
-                    print(f"[inspire] write failed ({exc})", flush=True)
-                self._give_up(str(exc))
-                return False
-            if rr is not None and getattr(rr, "isError", lambda: False)():
-                self._give_up("modbus error response")
-                return False
+        t0 = time.monotonic()
+        try:
+            rr = c.write_registers(REG_TARGET, _rad_to_ctrl(q6).tolist(), **{self._unit_kw: 1})
+        except Exception as exc:
+            self._t[key].append(time.monotonic() - t0)
+            if self._fails == 0:
+                print(f"[inspire] write failed ({exc})", flush=True)
+            self._give_up(str(exc))
+            return False
+        self._t[key].append(time.monotonic() - t0)
+        if rr is not None and getattr(rr, "isError", lambda: False)():
+            self._give_up("modbus error response")
+            return False
         return True
 
-    def open_hands(self) -> bool:
-        """Park both hands OPEN -- the rest pose the policy's state assumes at episode start."""
-        return self.write(np.zeros(N_FINGERS, np.float32), np.zeros(N_FINGERS, np.float32))
+    # --- the control-path API. NEITHER of these touches Modbus. ---------------------------
+
+    def read(self):
+        """Latest hand reading, or None if there has never been one. NEVER blocks.
+
+        Returns whatever the Modbus thread last managed to read. During a device stall this
+        returns the pre-stall values (stale, not wrong) instead of holding up the caller --
+        which matters because this runs inside the INFERENCE worker, and that worker's elapsed
+        time is measured as `delay_ticks` and fed to real-time chunking. A blocking read here
+        used to charge a multi-second Modbus timeout straight to the RTC delay estimate.
+        """
+        self.start()
+        with self._lock:
+            return self._latest
+
+    def write(self, left6, right6) -> bool:
+        """Hand the Modbus thread a new target. NEVER blocks; returns False only when disabled.
+
+        Latest-wins: a target set between two thread ticks replaces the previous one rather than
+        queueing, so the hands always track the newest command and can never fall behind by a
+        backlog. Called from the 50 Hz publish loop while the thread runs at `SONIC_INSPIRE_HZ`.
+        """
+        if self._disabled:
+            return False
+        self.start()
+        with self._lock:
+            self._target = (np.asarray(left6, np.float32).copy(),
+                            np.asarray(right6, np.float32).copy())
+        return True
+
+    def open_hands(self, wait_s: float = 1.0) -> bool:
+        """Park both hands OPEN -- the rest pose the policy's state assumes at episode start.
+
+        Unlike the control-path writes this one WAITS (briefly) for the thread to confirm, since
+        it runs at startup/'i' rather than in the loop, and the caller uses the return value to
+        report whether the hands actually moved.
+        """
+        self._wrote_once.clear()
+        if not self.write(np.zeros(N_FINGERS, np.float32), np.zeros(N_FINGERS, np.float32)):
+            return False
+        return self._wrote_once.wait(timeout=wait_s)
+
+    def stats(self) -> dict:
+        """Per-hand Modbus timing for the diagnostics line. Cheap; safe to call every chunk.
+
+        Reports last and max over the recent window for each of the four operations separately,
+        because "the hands are slow" is not actionable -- which hand, and reading or writing, is.
+        """
+        def _ms(key):
+            d = self._t[key]
+            return (0.0, 0.0) if not d else (d[-1] * 1e3, max(d) * 1e3)
+        with self._lock:
+            age = (time.monotonic() - self._latest_t) if self._latest is not None else float("nan")
+        out = {"age_ms": age * 1e3, "hz": self._hz, "overruns": self._overruns,
+               "disabled": self._disabled}
+        for k in ("read_left", "read_right", "write_left", "write_right", "tick"):
+            out[k] = _ms(k)
+        return out
 
     def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
         for c in self._clients or []:
             c.close()
         self._clients = None
