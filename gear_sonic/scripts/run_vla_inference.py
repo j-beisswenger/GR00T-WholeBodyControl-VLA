@@ -863,12 +863,16 @@ def main(config: InferenceConfig):
                 print("Received empty prompt change -- ignoring.")
             return
 
+        # Recording keys are acted on by the data exporter, which subscribes to this same
+        # keyboard channel; these lines only echo them into the inference pane. Episodes are
+        # bracketed automatically (see publish_record_command), so these are overrides:
+        # 's'/'f' end the current episode early, keeping or discarding it.
         if key == "c":
-            print("Keyboard: 'c' (start recording -- handled by data exporter)")
+            print("Keyboard: 'c' (toggle recording -- handled by data exporter)")
         elif key == "s":
-            print("Keyboard: 's' (stop recording success -- handled by data exporter)")
-        elif key == "f":
-            print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
+            print("Keyboard: 's' (stop recording, SAVE -- handled by data exporter)")
+        elif key in ("f", "x"):
+            print(f"Keyboard: '{key}' (stop recording, DISCARD -- handled by data exporter)")
         elif key == "i":
             if cpp_loop_running and cpp_mode == "PLANNER":
                 if send_cpp_control_command(start=True, planner=False):

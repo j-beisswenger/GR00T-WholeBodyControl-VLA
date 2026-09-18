@@ -348,7 +348,9 @@ def main(config: InferenceLaunchConfig):
         pub = ctx.socket(zmq.PUB)
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
-        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=init pose, [/]=toggle hands, t=prompt')
+        print('Keyboard publisher ready.')
+        print('  p=pause/resume (also starts/stops recording)  k=start/stop C++ loop  i=init pose')
+        print('  [/]=toggle hands  t <text>=prompt   |  recording overrides: s=save now  f/x=discard  c=toggle')
         while True:
             key = input()
             if key.startswith('t '):
@@ -448,16 +450,21 @@ def main(config: InferenceLaunchConfig):
     print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Keyboard controls (type in pane 1):")
-    print("    p        - Pause / resume inference")
-    print("    k        - Start / stop C++ control loop")
-    print("    i        - Send initial pose")
+    print("    p        - Pause / resume inference"
+          + (" (RESUME starts an episode, PAUSE saves it)" if config.data_exporter else ""))
+    print("    k        - Start / stop C++ control loop"
+          + (" (stop also saves the episode)" if config.data_exporter else ""))
+    print("    i        - Send initial pose"
+          + (" (also saves the episode; the blend is not part of it)"
+             if config.data_exporter else ""))
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")
     if config.data_exporter:
-        print("    c        - Start recording episode")
-        print("    s        - Stop recording (success)")
-        print("    f        - Stop recording (failure)")
+        print("    -- recording is automatic; these are overrides --")
+        print("    s        - Stop recording now and SAVE")
+        print("    f / x    - Stop recording now and DISCARD (a bad attempt)")
+        print("    c        - Toggle recording by hand (start / stop+save)")
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

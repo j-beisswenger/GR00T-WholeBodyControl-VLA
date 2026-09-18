@@ -334,7 +334,20 @@ class GrootDataCollector:
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
-        elif key == "x":
+        elif key == "s":
+            # STOP + SAVE. The keyboard pane has advertised this since forever and nothing
+            # implemented it: pressing 's' printed "stop recording success -- handled by data
+            # exporter" from run_vla_inference and then did nothing at all here, so an operator
+            # who used it instead of a second 'c' lost the episode. Addressed absolutely rather
+            # than as a toggle, for the same reason as `_handle_record_command`.
+            if self._episode_state.get_state() == self._episode_state.RECORDING:
+                self._episode_state.change_state()          # -> NEED_TO_SAVE, main loop saves
+                self._print_and_say("Stopping recording, preparing to save", blocking=False)
+        elif key in ("x", "f"):
+            # DISCARD. 'f' ("stop recording failure") was advertised and unimplemented like 's';
+            # it means the same thing as the long-standing 'x', so it is an alias rather than a
+            # second mechanism. Worth more now that episodes are bracketed automatically: the
+            # robot cannot know an attempt went badly, so this is the only way to say so.
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
