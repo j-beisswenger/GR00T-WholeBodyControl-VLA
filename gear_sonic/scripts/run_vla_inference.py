@@ -404,24 +404,32 @@ def prepare_observation_from_sensors(
     inspire_reader=None,
     state_q_dev: bool = True,
     permute_dex3_hands: bool = True,
+    timings: dict | None = None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
     Returns:
         observation dict, or None if sensor data not yet available.
     """
+    _t0 = time.monotonic()
     camera_msg = camera_subscriber.read()
+    if timings is not None:
+        timings["cam"] = time.monotonic() - _t0
     if camera_msg is None:
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for camera msg..", flush=True)
         return None
 
+    _t0 = time.monotonic()
     state_msg = state_subscriber.get_msg()
+    if timings is not None:
+        timings["state"] = time.monotonic() - _t0
     if state_msg is None:
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
         return None
 
+    _t_fk = time.monotonic()
     cam_img = camera_msg["images"]["ego_view"]
     ego_override = _ego_video_frame()
     if ego_override is not None:
@@ -491,10 +499,13 @@ def prepare_observation_from_sensors(
             observation["state"]["left_hand"] = left[np.newaxis, np.newaxis]
             observation["state"]["right_hand"] = right[np.newaxis, np.newaxis]
 
+    if timings is not None:
+        timings["fk"] = time.monotonic() - _t_fk
     return observation
 
 
-def run_policy_inference_and_process(policy, observation, robot_model, options=None):
+def run_policy_inference_and_process(policy, observation, robot_model, options=None,
+                                     timings: dict | None = None):
     """Run policy inference via Isaac-GR00T PolicyClient and process results.
 
     Args:
@@ -506,7 +517,22 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
         processed_action dict or None on error.
     """
     try:
+        # SERVER round-trip as the robot sees it: request on the wire -> reply in hand. This is
+        # the number to look at first when latency spikes, because everything else in the
+        # pipeline is local and sub-millisecond by comparison.
+        _t0 = time.monotonic()
         action, info = policy.get_action(observation, options)
+        if timings is not None:
+            timings["srv"] = time.monotonic() - _t0
+            # Servers that report their own timing (our pi0.5 / dit4dit bridges do) let us split
+            # the round-trip into model compute and NETWORK -- request serialization, the ~1 MB
+            # uncompressed ego frame on the wire, and the reply. A `net` in the seconds with a
+            # small `model` means the link, not the policy; the reverse means the policy.
+            _srv_ms = (info or {}).get("server_ms")
+            if _srv_ms is not None:
+                timings["model"] = float((info or {}).get("infer_ms", _srv_ms)) / 1e3
+                timings["net"] = timings["srv"] - float(_srv_ms) / 1e3
+        _t_post = time.monotonic()
 
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
@@ -539,6 +565,8 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
             processed_action["left_hand_joints"] = inspire12[:, :6]
             processed_action["right_hand_joints"] = inspire12[:, 6:]
 
+        if timings is not None:
+            timings["post"] = time.monotonic() - _t_post
         return processed_action
     except Exception as e:
         print(f"Error in inference: {e}")
@@ -571,7 +599,12 @@ def _inference_worker_loop(
 
             busy_event.set()
             try:
-                observation = prepare_obs_fn()
+                # Stage timings for the [lat] breakdown. `queue` is how long the request sat
+                # between the main loop dispatching it and this thread picking it up -- a large
+                # value there means the worker was still busy with the previous chunk, i.e. the
+                # policy cannot keep up with --rate, which looks like latency but is saturation.
+                stage = {"queue": time.monotonic() - dispatch_time}
+                observation = prepare_obs_fn(stage)
                 if observation is None:
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
@@ -582,17 +615,19 @@ def _inference_worker_loop(
                 # delay, which shifts the chunk earlier than the guidance placed it -- the
                 # direction that brings the chunk-boundary jump back.
                 inference_start_time = dispatch_time
-                processed_action = inference_fn(observation, options)
+                processed_action = inference_fn(observation, options, stage)
+                stage["ready"] = time.monotonic()
 
                 if processed_action is not None:
+                    item = (processed_action, inference_start_time, stage)
                     try:
-                        result_queue.put_nowait((processed_action, inference_start_time))
+                        result_queue.put_nowait(item)
                     except queue.Full:
                         try:
                             result_queue.get_nowait()
-                            result_queue.put_nowait((processed_action, inference_start_time))
+                            result_queue.put_nowait(item)
                         except queue.Empty:
-                            result_queue.put_nowait((processed_action, inference_start_time))
+                            result_queue.put_nowait(item)
             finally:
                 busy_event.clear()
         except Exception as e:
@@ -811,6 +846,9 @@ def main(config: InferenceConfig):
 
     recording_active = False
     chunk_log = []           # one entry per chunk RECEIVED while an episode is open
+    # Column order of the per-chunk latency breakdown stored alongside the chunks. Kept as one
+    # named tuple of keys so the writer and the reader cannot drift apart.
+    LAT_KEYS = ("queue", "cam", "state", "fk", "srv", "model", "net", "post", "wait")
 
     def flush_chunk_log(reason: str):
         """Write the episode's received chunks to an .npz beside the dataset, then clear.
@@ -842,6 +880,14 @@ def main(config: InferenceConfig):
                 inference_delay=np.asarray([c["delay"] for c in chunk_log], dtype=np.float64),
                 start_index=np.asarray([c["start_index"] for c in chunk_log], dtype=np.int64),
                 prompt=np.asarray([c["prompt"] for c in chunk_log]),
+                # (n, len(LAT_KEYS)) seconds per stage -- the same breakdown the [lat] line
+                # prints, kept per chunk so a spike can be attributed after the fact instead of
+                # only being watched scroll past. NaN where a server did not report its timing.
+                latency=np.asarray(
+                    [[c["stage"].get(k, np.nan) for k in LAT_KEYS] for c in chunk_log],
+                    dtype=np.float64,
+                ),
+                latency_keys=np.asarray(LAT_KEYS),
             )
             print_green(f"[chunks] wrote {len(chunk_log)} chunks -> {path} ({reason})")
         except Exception as e:  # noqa: BLE001 -- logging must never break the control loop
@@ -1012,7 +1058,7 @@ def main(config: InferenceConfig):
             result_queue,
             inference_stop_event,
             inference_busy_event,
-            lambda: prepare_observation_from_sensors(
+            lambda stage=None: prepare_observation_from_sensors(
                 camera_subscriber=camera_subscriber,
                 state_subscriber=state_subscriber,
                 robot_model=robot_model,
@@ -1021,12 +1067,14 @@ def main(config: InferenceConfig):
                 inspire_reader=inspire_reader,
                 state_q_dev=config.state_q_dev,
                 permute_dex3_hands=config.permute_dex3_hands,
+                timings=stage,
             ),
-            lambda obs, options=None: run_policy_inference_and_process(
+            lambda obs, options=None, stage=None: run_policy_inference_and_process(
                 policy=n1_policy,
                 observation=obs,
                 robot_model=robot_model,
                 options=options,
+                timings=stage,
             ),
         ),
         daemon=True,
@@ -1040,8 +1088,14 @@ def main(config: InferenceConfig):
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:
-                processed_action, inference_start_time = result_queue.get_nowait()
-                inference_delay = time.monotonic() - inference_start_time
+                processed_action, inference_start_time, stage = result_queue.get_nowait()
+                now_ = time.monotonic()
+                inference_delay = now_ - inference_start_time
+                # `wait` closes the books: the worker had the chunk ready at stage["ready"], and
+                # this is how long it then sat before THIS loop picked it up. It is charged to
+                # the delay like everything else, so a big value here means the publish loop is
+                # late, not the policy.
+                stage["wait"] = now_ - stage.get("ready", now_)
                 rtc_delay_buffer.append(inference_delay)  # feeds the conservative `d` estimate
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
@@ -1072,6 +1126,7 @@ def main(config: InferenceConfig):
                             "delay": float(inference_delay),
                             "start_index": int(action_chunk_index),
                             "prompt": language_prompt_ref[0],
+                            "stage": dict(stage),
                         })
                     except Exception as e:  # noqa: BLE001 -- never break the loop for logging
                         print(f"Warning: chunk log skipped a chunk: {e}")
@@ -1098,6 +1153,22 @@ def main(config: InferenceConfig):
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", '
                     f"latency: {inference_delay:.3f}s = rest, hands off-path){hands_note}"
+                )
+                # Where the latency actually went. These five stages tile the whole measured
+                # delay, so whichever dominates IS the answer -- no guessing which side is slow.
+                print(
+                    f"[lat] total {inference_delay*1e3:7.1f}ms ="
+                    f"  queue {stage.get('queue', 0)*1e3:6.1f}"
+                    f" + obs {(stage.get('cam', 0) + stage.get('state', 0) + stage.get('fk', 0))*1e3:6.1f}"
+                    f" (cam {stage.get('cam', 0)*1e3:5.1f}"
+                    f" state {stage.get('state', 0)*1e3:5.1f}"
+                    f" fk {stage.get('fk', 0)*1e3:5.1f})"
+                    f" + SRV {stage.get('srv', 0)*1e3:7.1f}"
+                    + (f" (model {stage['model']*1e3:7.1f} net {stage['net']*1e3:7.1f})"
+                       if "net" in stage else "")
+                    + f" + post {stage.get('post', 0)*1e3:5.1f}"
+                    f" + wait {stage.get('wait', 0)*1e3:6.1f}",
+                    flush=True,
                 )
             except queue.Empty:
                 pass
