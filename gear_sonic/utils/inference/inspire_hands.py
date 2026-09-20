@@ -48,6 +48,10 @@ PORT = int(os.environ.get("SONIC_INSPIRE_PORT", "6000"))
 REG_ACTUAL = 1546          # 6 measured finger positions (read)
 REG_TARGET = 1486          # 6 finger setpoints (write)
 N_FINGERS = 6
+
+# Socket timeout for one Modbus attempt, and the cap on reconnect backoff.
+_CONNECT_TIMEOUT_S = 0.5
+_RETRY_MAX_S = 2.0
 CTRL_MAX = 1000.0
 
 # Modbus slot -> codec slot. Modbus is [pinky, ring, middle, index, thumb_bend, thumb_rotate];
@@ -164,6 +168,7 @@ class _HandChannel:
         self._warned = False
         self._announced = False
         self._fails = 0
+        self._connect_fails = 0
         self._disabled = False
 
         self._lock = threading.Lock()
@@ -198,13 +203,29 @@ class _HandChannel:
                       "(pip install pymodbus)", flush=True)
                 self._warned = True
             return False
-        c = ModbusTcpClient(self.host, port=self.port)
+        # Short timeout. The default is ~3 s and pymodbus retries, so a hand that has dropped
+        # off the network stalled THIS thread for ~12 s per attempt (measured: tick 12009 ms).
+        # The hand is one switch hop away on a 1 Gb link -- if it does not answer in half a
+        # second it is not going to. A short timeout also means we notice its RETURN promptly
+        # instead of up to 12 s later.
+        c = ModbusTcpClient(self.host, port=self.port, timeout=_CONNECT_TIMEOUT_S)
         if not c.connect():
+            # Close the client we just built. Without this every failed attempt abandons a
+            # socket: at a 30 Hz tick that is a file descriptor per 33 ms while a hand is gone.
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._connect_fails += 1
             if not self._warned:
-                print(f"[inspire] cannot reach {self.name} hand at {self.host}:{self.port} -- "
-                      "that hand disabled", flush=True)
+                print(f"[inspire] cannot reach {self.name} hand at {self.host}:{self.port} "
+                      f"(will keep retrying, backing off to {_RETRY_MAX_S:.0f}s)", flush=True)
                 self._warned = True
             return False
+        self._connect_fails = 0
+        if self._warned:      # it came back
+            print(f"[inspire] {self.name} hand reachable again at {self.host}", flush=True)
+            self._warned = False
         self._client = c
         if self._unit_kw is None:
             # pymodbus renamed the unit-id argument between 3.x and 4.x. Pick whichever this
@@ -224,6 +245,14 @@ class _HandChannel:
         A reconnect storm is worse than being off: it printed a line per tick and eventually got
         the hands to refuse connections outright.
         """
+        # Close before dropping the reference. Leaving it open stranded a live ESTABLISHED
+        # socket with unsent bytes in its queue for the rest of the run -- one per drop episode,
+        # visible in `ss -tnp` long after the hand went away.
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:  # noqa: BLE001
+                pass
         self._client = None
         self._fails += 1
         if self._fails >= 3 and not self._disabled:
@@ -237,7 +266,11 @@ class _HandChannel:
             if not self._connect():
                 if self._disabled:
                     return
-                self._stop.wait(self._period)
+                # Exponential backoff, capped. Retrying a missing hand 30x a second buys
+                # nothing and makes the log unreadable; a hand that has power-cycled is back
+                # within a few seconds of the cap either way.
+                wait = min(self._period * (2 ** min(self._connect_fails, 8)), _RETRY_MAX_S)
+                self._stop.wait(wait)
                 continue
 
             q = self._read_once()
