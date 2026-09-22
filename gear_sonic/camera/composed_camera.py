@@ -53,7 +53,7 @@ class ComposedCameraConfig:
     """Camera configuration for the composed camera server."""
 
     ego_view_camera: str | None = "oak"
-    """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
+    """Camera type for ego view: oak, oak_mono, realsense, zed, usb, egocam, or None."""
 
     ego_view_device_id: str | None = None
     """Device ID for ego view camera (OAK MxID, RealSense serial, USB /dev/video index)."""
@@ -99,6 +99,15 @@ class ComposedCameraConfig:
 
     mjpeg_quality: int = 80
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
+
+    egocam_calib: str | None = None
+    """``egocam`` type: camera_calib.json from egocam's calibrate.py for this device + mode."""
+
+    egocam_hfov: float | None = None
+    """``egocam`` type: assumed horizontal FOV (deg) for a distortion-free pinhole, if no calib."""
+
+    egocam_pitch_deg: float = 0.0
+    """``egocam`` type: pitch the virtual EgoStandard camera down by this many degrees."""
 
     def __post_init__(self):
         self.run_as_server = self.server
@@ -383,6 +392,15 @@ class ComposedCameraSensor(Sensor, SensorServer):
 
             print(f"Initializing Replay Dummy Sensor for camera type: {camera_type}")
             return ReplayDummySensor(video_path=camera_type)
+
+        elif camera_type == "egocam":
+            from gear_sonic.camera.drivers.egocam import EgoCamConfig, EgoCamSensor
+
+            ec = EgoCamConfig()
+            ec.calib = self.config.egocam_calib
+            ec.hfov_deg = self.config.egocam_hfov
+            ec.pitch_deg = self.config.egocam_pitch_deg
+            return EgoCamSensor(config=ec, mount_position=mount_position, device=device_id)
 
         elif camera_type == "usb":
             from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
