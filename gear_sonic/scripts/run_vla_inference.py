@@ -146,6 +146,14 @@ class InferenceConfig:
     one extra array per request. A server that does not implement RTC ignores the options and
     behaves exactly as before, so this is safe to leave on."""
 
+    rtc_pin_margin_ticks: int = 2
+    """Ticks pinned beyond the p90 delay estimate (rounded up). The robot starts each new chunk
+    at the row of that chunk's OWN measured delay, so with d = p90 about one chunk in ten lands
+    past the pinned prefix, straight into rows the model generated freely -- the seam. Measured
+    offline (HE, 245 episodes): the takeover jump grows ~2x faster per row past the pin for
+    pi0.5 than for GR00T, and does not grow with pin length at all, so over-pinning costs only
+    reactivity (2 ticks = 40 ms). The server still clamps d to the checkpoint's trained max."""
+
     rtc_delay_buffer_size: int = 20
     """How many recent inference delays to keep. `d` is the p90 over this window. Needs to be
     large enough that a single slow sample sits outside the quantile -- at 20, one outlier is
@@ -1205,6 +1213,7 @@ def main(config: InferenceConfig):
                                 rtc_delay_buffer,
                                 config.action_publish_rate,
                                 config.action_horizon,
+                                margin_ticks=config.rtc_pin_margin_ticks,
                             ),
                         }
                 try:

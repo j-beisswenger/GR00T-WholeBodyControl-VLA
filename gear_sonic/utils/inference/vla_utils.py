@@ -280,7 +280,7 @@ def _append_hand_half(body_row: "np.ndarray", hand_token: Any) -> "np.ndarray":
 
 def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: int,
                              outlier_s: float = 1.0, percentile: float = 90.0,
-                             fallback_ticks: int = 3) -> int:
+                             fallback_ticks: int = 3, margin_ticks: int = 0) -> int:
     """Inference delay in controller ticks, estimated with an upper quantile.
 
     Real-time chunking freezes the first ``d`` actions of a new chunk to the previous plan,
@@ -308,6 +308,11 @@ def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: 
         outlier_s: Samples above this are dropped as non-predictive (see below).
         percentile: Quantile of the retained samples to use, in [0, 100].
         fallback_ticks: d to use when no sample is usable. Deliberately small but NOT zero.
+        margin_ticks: extra ticks pinned on top of the quantile, which is rounded UP. p90 alone
+            still leaves ~10% of chunks landing past the pin by construction (the robot starts
+            at the row of the chunk's OWN delay), and pi0.5 pays ~2x GR00T's seam per row past
+            the pin while the seam does not grow with pin length. See run_vla_inference's
+            `rtc_pin_margin_ticks`.
 
     Returns:
         d in ticks, ``fallback_ticks`` when no delay has been observed yet.
@@ -336,4 +341,7 @@ def conservative_delay_ticks(delay_buffer, control_freq: float, action_horizon: 
         # join closed and costs almost no reactivity if the true delay turns out to be small.
         return int(np.clip(fallback_ticks, 0, max(action_horizon - 1, 0)))
     estimate = float(np.percentile(delays, percentile))
-    return calculate_latency_compensated_index(estimate, control_freq, action_horizon)
+    # Round UP (np.round sends 6.5 -> 6, i.e. one row short), with a tolerance so an exact
+    # 0.30 s * 50 = 15.000000000000002 stays 15, then add the margin.
+    ticks = int(np.ceil(estimate * control_freq - 1e-6)) + int(margin_ticks)
+    return int(np.clip(ticks, 0, max(action_horizon - 1, 0)))

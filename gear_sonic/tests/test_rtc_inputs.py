@@ -110,6 +110,16 @@ def test_delay_estimate_handles_cold_start_and_is_bounded_by_the_horizon():
     assert conservative_delay_ticks([], 50, 2, fallback_ticks=99) == 1
 
 
+def test_pin_margin_rounds_up_and_adds_ticks():
+    # p90 6.5 ticks: np.round would give 6 (banker's rounding), one row short of the delay.
+    assert conservative_delay_ticks([0.13] * 20, 50, HORIZON) == 7
+    # The margin sits on top of the rounded-up quantile, and is still clamped to the horizon.
+    assert conservative_delay_ticks([0.13] * 20, 50, HORIZON, margin_ticks=2) == 9
+    assert conservative_delay_ticks([0.9], 50, HORIZON, margin_ticks=10) == HORIZON - 1
+    # The cold-start fallback is already conservative and does not take the margin.
+    assert conservative_delay_ticks([], 50, HORIZON, margin_ticks=2) == 3
+
+
 def test_jit_compile_outlier_does_not_pin_the_delay_estimate():
     # The guided sampler is a separate XLA program, so the first request carrying a previous
     # chunk pays a one-off compile of tens of seconds. As a plain MAX over the buffer that
