@@ -403,6 +403,80 @@ def reset_hand_filter_state():
     _HAND_FILTER_STATE = None
 
 
+# ---------------------------------------------------------------------------
+# Joint-space checkpoints (unitree_g1_sonic_joints / unitree_g1_sonic_joints_handtoken)
+# ---------------------------------------------------------------------------
+# These predict, per 50 Hz tick, robot_joints (29, absolute rad, MuJoCo order) + robot_root_ori
+# ([yaw_rate, roll, pitch]) + hand_ctrl (12, Inspire command / 1000, 1 = open) | hand_token (64).
+# SONIC executes them as a G1-mode REFERENCE: the v1.1 encoder turns the reference into one token
+# per tick against the LIVE base quaternion, and that token goes to the C++ decoder exactly like a
+# token checkpoint's. The converter is the sim client's (deploy/sim/gr00t/joints_to_sonic.py), so
+# robot and sim run the same code.
+
+# isaaclab index of each mujoco joint (== isaaclab_to_mujoco in the C++, deploy/sim/pi05/sonic_sim.py)
+ISAAC_IDX_OF_MJ = np.array([0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8,
+                            11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28])
+JOINT_BODY_KEYS = ("robot_joints", "robot_root_ori")
+_JOINTS_CONV = None
+
+
+def is_joints_embodiment(tag: str) -> bool:
+    return "sonic_joints" in tag
+
+
+def joints_converter():
+    """The JointsToSonic reference holder, built once (loads the v1.1 encoder ONNX, CPU)."""
+    global _JOINTS_CONV
+    if _JOINTS_CONV is None:
+        import sys
+
+        sim_dir = _humanoid_vla_root() / "deploy" / "sim" / "gr00t"
+        if str(sim_dir) not in sys.path:
+            sys.path.insert(0, str(sim_dir))
+        from joints_to_sonic import JointsToSonic
+
+        _JOINTS_CONV = JointsToSonic(np.argsort(ISAAC_IDX_OF_MJ), threads=2)
+        print(f"[joints] SONIC v1.1 encoder loaded for the joint-space checkpoint", flush=True)
+    return _JOINTS_CONV
+
+
+def _chunk2d(a):
+    a = np.asarray(a, np.float32)
+    while a.ndim > 2:
+        a = a[0]
+    return a
+
+
+def joint_action_rows(action: dict, start: int, last: int) -> "np.ndarray | None":
+    """Full-width action rows [start:last] in the model's key order (joints, root, hand), the
+    real-time-chunking prefix of a joint-space checkpoint. None if a key is missing."""
+    hand = "hand_token" if action.get("hand_token") is not None else "hand_ctrl"
+    parts = []
+    for k in JOINT_BODY_KEYS + (hand,):
+        v = action.get(k)
+        if v is None:
+            return None
+        parts.append(_chunk2d(v)[start:last])
+    return np.concatenate(parts, axis=-1)
+
+
+def _inspire_limit12():
+    from gear_sonic.utils.inference.inspire_hands import INSPIRE_LIMIT
+
+    return np.tile(INSPIRE_LIMIT, 2).astype(np.float32)
+
+
+def hand_ctrl_to_rad(ctrl):
+    """hand_ctrl in [0, 1] (1 = open), codec slot order -> Inspire rad (0 = open), the inverse of
+    inspire_hands._rad_to_ctrl / hand_codec.inspire_rad_to_ctrl."""
+    return _inspire_limit12() * (1.0 - np.clip(np.asarray(ctrl, np.float32), 0.0, 1.0))
+
+
+def rad_to_hand_ctrl(rad):
+    """Inspire rad (0 = open), codec slot order -> hand_ctrl in [0, 1] (1 = open)."""
+    return np.clip(1.0 - np.asarray(rad, np.float32) / _inspire_limit12(), 0.0, 1.0)
+
+
 def prepare_observation_from_sensors(
     camera_subscriber,
     state_subscriber,
@@ -413,8 +487,13 @@ def prepare_observation_from_sensors(
     state_q_dev: bool = True,
     permute_dex3_hands: bool = True,
     timings: dict | None = None,
+    hand_ctrl_state=None,
 ):
     """Read sensors and prepare observation for the VLA policy.
+
+    hand_ctrl_state: joint-space checkpoints only -- a callable returning the Inspire command in
+    force as hand_ctrl (12, [0, 1], 1 = open), which is what they were trained on as hand state
+    (action.hand_ctrl at the current tick), not the measured hand.
 
     Returns:
         observation dict, or None if sensor data not yet available.
@@ -507,8 +586,14 @@ def prepare_observation_from_sensors(
             observation["state"]["left_hand"] = left[np.newaxis, np.newaxis]
             observation["state"]["right_hand"] = right[np.newaxis, np.newaxis]
 
+    if hand_ctrl_state is not None:
+        ctrl = np.asarray(hand_ctrl_state(), np.float32)
+        observation["state"]["left_hand"] = ctrl[:6][np.newaxis, np.newaxis]
+        observation["state"]["right_hand"] = ctrl[6:][np.newaxis, np.newaxis]
+
     if timings is not None:
         timings["fk"] = time.monotonic() - _t_fk
+        timings["base_quat"] = base_quat.copy()   # joint-space: the reference's row-0 heading
     return observation
 
 
@@ -544,6 +629,20 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
 
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
+
+        if "robot_joints" in action or "action.robot_joints" in action:
+            # joint-space checkpoint: no token bound to check; hands -> Inspire targets here
+            processed_action = concat_action(robot_model, action)
+            if os.environ.get("SONIC_INSPIRE_HANDS", "0") == "1":
+                if processed_action.get("hand_token") is not None:
+                    inspire12 = _decode_hand_token_chunk(processed_action["hand_token"])
+                else:
+                    inspire12 = hand_ctrl_to_rad(_chunk2d(processed_action["hand_ctrl"]))
+                processed_action["left_hand_joints"] = inspire12[:, :6]
+                processed_action["right_hand_joints"] = inspire12[:, 6:]
+            if timings is not None:
+                timings["post"] = time.monotonic() - _t_post
+            return processed_action
 
         motion_key = "motion_token" if "motion_token" in action else "action.motion_token"
         # The server bounds tokens to the FSQ range before returning, so this check on the
@@ -704,6 +803,10 @@ def main(config: InferenceConfig):
         f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}"
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
+    joints_mode = is_joints_embodiment(config.embodiment_tag)
+    joints_conv = joints_converter() if joints_mode else None
+    joints_hand_ctrl = np.ones(12, np.float32)   # Inspire command in force (hand state), 1 = open
+    joints_dispatch_yaw0 = None                   # planned heading at the tick of the last dispatch
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
@@ -966,6 +1069,7 @@ def main(config: InferenceConfig):
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
         nonlocal zmq_frame_counter, last_sent_motion_token, last_sent_hand_token
+        nonlocal joints_hand_ctrl
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -1014,6 +1118,7 @@ def main(config: InferenceConfig):
             action_chunk_index = 0
             reset_ego_video_clock()
             reset_hand_filter_state()
+            joints_hand_ctrl = np.ones(12, np.float32)   # 'i' opens the hands
             print("Cleared cached action chunk, reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
@@ -1075,6 +1180,7 @@ def main(config: InferenceConfig):
                 inspire_reader=inspire_reader,
                 state_q_dev=config.state_q_dev,
                 permute_dex3_hands=config.permute_dex3_hands,
+                hand_ctrl_state=(lambda: joints_hand_ctrl) if joints_mode else None,
                 timings=stage,
             ),
             lambda obs, options=None, stage=None: run_policy_inference_and_process(
@@ -1108,6 +1214,13 @@ def main(config: InferenceConfig):
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
                 )
+                if joints_mode:
+                    # the predicted joints become the G1-mode reference; row 0's heading is the
+                    # planned heading at the observation tick (carried across replans, clipped to
+                    # MAX_YAW_LAG of the measured yaw), or the measured yaw when nothing ran
+                    joints_conv.set_chunk(_chunk2d(processed_action["robot_joints"]),
+                                          _chunk2d(processed_action["robot_root_ori"]),
+                                          stage["base_quat"], yaw0=joints_dispatch_yaw0)
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 logged_awaiting_chunk = False
@@ -1117,11 +1230,14 @@ def main(config: InferenceConfig):
                     # never executed and rows after `start_index + ticks-until-next-chunk` are
                     # superseded -- neither is recoverable from the dataset.
                     try:
-                        mt = np.asarray(get_action_field(processed_action, "motion_token"),
-                                        dtype=np.float32)
+                        mt = (joint_action_rows(processed_action, 0, config.action_horizon)
+                              if joints_mode else
+                              np.asarray(get_action_field(processed_action, "motion_token"),
+                                         dtype=np.float32))
                         if mt.ndim == 3:
                             mt = mt[0]
-                        ht = get_action_field(processed_action, "hand_token", required=False)
+                        ht = (None if joints_mode else
+                              get_action_field(processed_action, "hand_token", required=False))
                         if ht is not None:
                             ht = np.asarray(ht, dtype=np.float32)
                             if ht.ndim == 3:
@@ -1195,7 +1311,26 @@ def main(config: InferenceConfig):
                 # index k of the chunk about to be generated; sampling it when the reply arrives
                 # would be off by the whole inference delay.
                 request_options = None
-                if config.rtc:
+                running = not pause_loop and cached_action_chunk is not None
+                if joints_mode:
+                    joints_dispatch_yaw0 = (joints_conv.ref_yaw(action_chunk_index)
+                                            if running else None)
+                if config.rtc and joints_mode:
+                    # full-width rows the robot will still execute (joints, root, hand); nothing
+                    # while holding -- the held token is not a joint-space row
+                    prev_tail = (joint_action_rows(cached_action_chunk, action_chunk_index,
+                                                   config.action_horizon) if running else None)
+                    if prev_tail is not None and len(prev_tail) > 0:
+                        request_options = {
+                            "prev_chunk_tail": prev_tail,
+                            "delay_ticks": conservative_delay_ticks(
+                                rtc_delay_buffer,
+                                config.action_publish_rate,
+                                config.action_horizon,
+                                margin_ticks=config.rtc_pin_margin_ticks,
+                            ),
+                        }
+                elif config.rtc:
                     prev_tail = build_prev_chunk_tail(
                         cached_action_chunk=cached_action_chunk,
                         action_chunk_index=action_chunk_index,
@@ -1260,18 +1395,30 @@ def main(config: InferenceConfig):
                 else:
                     # Action arrays arrive as (B, T, D) from the model.
                     # Squeeze batch dim to get (T, D), then index by time step.
-                    motion_token = np.asarray(
-                        get_action_field(processed_action, "motion_token"),
-                        dtype=np.float32,
-                    )
-                    if motion_token.ndim == 3:
-                        motion_token = motion_token[0]
+                    if joints_mode:
+                        horizon = _chunk2d(processed_action["robot_joints"]).shape[0]
+                        current_idx = min(action_chunk_index, horizon - 1)
+                        live = state_subscriber.get_msg()
+                        quat = (np.asarray(live["base_quat"], np.float64)
+                                if live is not None and "base_quat" in live else None)
+                        if quat is None:
+                            print("[joints] no robot state -- skipping this tick", flush=True)
+                            _sleep_remaining(t_start, loop_period)
+                            continue
+                        motion_token = joints_conv.token(current_idx, quat)
+                    else:
+                        motion_token = np.asarray(
+                            get_action_field(processed_action, "motion_token"),
+                            dtype=np.float32,
+                        )
+                        if motion_token.ndim == 3:
+                            motion_token = motion_token[0]
 
-                    horizon = motion_token.shape[0] if motion_token.ndim == 2 else 1
-                    current_idx = min(action_chunk_index, horizon - 1)
+                        horizon = motion_token.shape[0] if motion_token.ndim == 2 else 1
+                        current_idx = min(action_chunk_index, horizon - 1)
 
-                    if motion_token.ndim == 2:
-                        motion_token = motion_token[current_idx]
+                        if motion_token.ndim == 2:
+                            motion_token = motion_token[current_idx]
 
                     # Optional: body-only models emit no hand joints. Left as
                     # None, they are simply omitted from the v4 pose message.
@@ -1306,6 +1453,12 @@ def main(config: InferenceConfig):
                     # that goes on the wire, so the two can never disagree. Rate-limited inside.
                     if inspire_reader is not None and left_hand_joints is not None:
                         inspire_reader.write(left_hand_joints, right_hand_joints)
+                    if joints_mode and left_hand_joints is not None:
+                        joints_hand_ctrl = rad_to_hand_ctrl(
+                            np.concatenate([left_hand_joints, right_hand_joints]))
+                    elif joints_mode and processed_action.get("hand_ctrl") is not None:
+                        joints_hand_ctrl = np.clip(select_action_step(
+                            processed_action["hand_ctrl"], current_idx), 0.0, 1.0)
 
                     # 6-DOF Inspire targets now RIDE the v4 message (pack_latent_action_message
                     # takes 6 or 7). Nothing downstream actuates them -- the C++ deploy drives
