@@ -633,13 +633,20 @@ def run_policy_inference_and_process(policy, observation, robot_model, options=N
         if "robot_joints" in action or "action.robot_joints" in action:
             # joint-space checkpoint: no token bound to check; hands -> Inspire targets here
             processed_action = concat_action(robot_model, action)
-            if os.environ.get("SONIC_INSPIRE_HANDS", "0") == "1":
-                if processed_action.get("hand_token") is not None:
-                    inspire12 = _decode_hand_token_chunk(processed_action["hand_token"])
-                else:
-                    inspire12 = hand_ctrl_to_rad(_chunk2d(processed_action["hand_ctrl"]))
-                processed_action["left_hand_joints"] = inspire12[:, :6]
-                processed_action["right_hand_joints"] = inspire12[:, 6:]
+            body = [np.asarray(processed_action.get(k), np.float32) for k in JOINT_BODY_KEYS]
+            if not all(np.isfinite(b).all() for b in body) or np.abs(body[1][..., 0]).max() > np.pi:
+                # the token path's bound check, for joints: a NaN reaches the encoder as a NaN
+                # token; yaw_rate was clamped to +-pi in training, so beyond it is a blow-up
+                print("[Warning] joint-space chunk not finite or |yaw_rate| > pi, skipping.")
+                return None
+            # hands -> Inspire targets. Decoded even with the hands disabled: the decoded command
+            # is also the hand STATE the next observation reports (training: action.hand_ctrl).
+            if processed_action.get("hand_token") is not None:
+                inspire12 = _decode_hand_token_chunk(processed_action["hand_token"])
+            else:
+                inspire12 = hand_ctrl_to_rad(_chunk2d(processed_action["hand_ctrl"]))
+            processed_action["left_hand_joints"] = inspire12[:, :6]
+            processed_action["right_hand_joints"] = inspire12[:, 6:]
             if timings is not None:
                 timings["post"] = time.monotonic() - _t_post
             return processed_action
@@ -700,7 +707,7 @@ def _inference_worker_loop(
                 # inference starts, not when it returns: `prev_chunk_tail` has to be sliced at
                 # the index being executed right now, so that tail[k] lines up with index k of
                 # the chunk about to be generated. Legacy callers may still enqueue None.
-                dispatch_time, options = inference_queue.get(timeout=0.1)
+                dispatch_time, options, *meta = inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -711,6 +718,8 @@ def _inference_worker_loop(
                 # value there means the worker was still busy with the previous chunk, i.e. the
                 # policy cannot keep up with --rate, which looks like latency but is saturation.
                 stage = {"queue": time.monotonic() - dispatch_time}
+                if meta:
+                    stage["yaw0"] = meta[0]   # joint-space: planned heading at THIS dispatch
                 observation = prepare_obs_fn(stage)
                 if observation is None:
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
@@ -807,6 +816,12 @@ def main(config: InferenceConfig):
     joints_conv = joints_converter() if joints_mode else None
     joints_hand_ctrl = np.ones(12, np.float32)   # Inspire command in force (hand state), 1 = open
     joints_dispatch_yaw0 = None                   # planned heading at the tick of the last dispatch
+    # The per-tick live quaternion gets its OWN subscriber: get_msg() clears the message, and a
+    # ZMQ socket must not be shared between threads, so reading the worker's subscriber here
+    # would starve one of the two of state. The last valid quaternion is reused on a quiet tick.
+    joints_state = (ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
+                    if joints_mode else None)
+    joints_quat = None
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
@@ -1203,6 +1218,20 @@ def main(config: InferenceConfig):
             # Consume result first so last_inference_time is fresh before trigger check
             try:
                 processed_action, inference_start_time, stage = result_queue.get_nowait()
+                if joints_mode:
+                    # the predicted joints become the G1-mode reference; row 0's heading is the
+                    # planned heading at the observation tick (carried across replans, clipped to
+                    # MAX_YAW_LAG of the measured yaw), or the measured yaw when nothing ran
+                    saved = (joints_conv.q_il, joints_conv.dq_il, joints_conv.quat)
+                    try:
+                        joints_conv.set_chunk(_chunk2d(processed_action["robot_joints"]),
+                                              _chunk2d(processed_action["robot_root_ori"]),
+                                              stage["base_quat"], yaw0=stage.get("yaw0"))
+                    except Exception as e:  # noqa: BLE001 -- drop the chunk, keep the old plan
+                        joints_conv.q_il, joints_conv.dq_il, joints_conv.quat = saved
+                        print(f"[joints] chunk dropped (old plan continues), could not become the reference: {e}",
+                              flush=True)
+                        raise queue.Empty
                 now_ = time.monotonic()
                 inference_delay = now_ - inference_start_time
                 # `wait` closes the books: the worker had the chunk ready at stage["ready"], and
@@ -1214,13 +1243,6 @@ def main(config: InferenceConfig):
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
                 )
-                if joints_mode:
-                    # the predicted joints become the G1-mode reference; row 0's heading is the
-                    # planned heading at the observation tick (carried across replans, clipped to
-                    # MAX_YAW_LAG of the measured yaw), or the measured yaw when nothing ran
-                    joints_conv.set_chunk(_chunk2d(processed_action["robot_joints"]),
-                                          _chunk2d(processed_action["robot_root_ori"]),
-                                          stage["base_quat"], yaw0=joints_dispatch_yaw0)
                 cached_action_chunk = processed_action
                 last_inference_time = time.monotonic()
                 logged_awaiting_chunk = False
@@ -1352,7 +1374,8 @@ def main(config: InferenceConfig):
                             ),
                         }
                 try:
-                    inference_queue.put_nowait((time.monotonic(), request_options))
+                    inference_queue.put_nowait((time.monotonic(), request_options,
+                                                joints_dispatch_yaw0))
                 except queue.Full:
                     pass
 
@@ -1398,14 +1421,19 @@ def main(config: InferenceConfig):
                     if joints_mode:
                         horizon = _chunk2d(processed_action["robot_joints"]).shape[0]
                         current_idx = min(action_chunk_index, horizon - 1)
-                        live = state_subscriber.get_msg()
-                        quat = (np.asarray(live["base_quat"], np.float64)
-                                if live is not None and "base_quat" in live else None)
-                        if quat is None:
-                            print("[joints] no robot state -- skipping this tick", flush=True)
+                        live = joints_state.get_msg(clear=False)
+                        if live is not None and "base_quat" in live:
+                            joints_quat = np.asarray(live["base_quat"], np.float64)
+                        try:
+                            if joints_quat is None:
+                                raise RuntimeError("no robot state (base_quat) yet")
+                            motion_token = joints_conv.token(current_idx, joints_quat)
+                        except Exception as e:  # noqa: BLE001 -- hold the last token, keep the loop
+                            print(f"[joints] token failed ({e}) -- holding the last token", flush=True)
+                            action_chunk_index = min(action_chunk_index + 1,
+                                                     config.action_horizon - 1)
                             _sleep_remaining(t_start, loop_period)
                             continue
-                        motion_token = joints_conv.token(current_idx, quat)
                     else:
                         motion_token = np.asarray(
                             get_action_field(processed_action, "motion_token"),
@@ -1523,6 +1551,8 @@ def main(config: InferenceConfig):
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()
+        if joints_state is not None:
+            joints_state.close()
         keyboard_listener.close()
         print("Shutdown complete.")
 
